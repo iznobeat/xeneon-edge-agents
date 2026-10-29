@@ -12,6 +12,9 @@
 #             @-mentions, read with your own Slack user token (see below)
 #   github    Open pull requests across an organization plus your unread
 #             notifications, read through the signed-in GitHub CLI (gh)
+#   game      A web game full-bleed under the header (Oh No! More Agents by
+#             default), in its own borderless window: Quickshell cannot load
+#             QtWebEngine, so it runs in Qt's qml runtime (needs qt6-webengine)
 
 dashboards = ["agents", "basecamp", "spotify"]
 
@@ -43,3 +46,11 @@ card_table = 9711341101
 # user = "my-work-login"
 # bin = "/usr/bin/gh"   # if `gh` on PATH is a wrapper (e.g. mise) that
 #                       # cannot run in the daemon's read-only sandbox
+
+# Game: the page shown by the "game" dashboard. It gets the real size of the
+# area under the header and picks its own scale; touch reaches it as pointer
+# input. Point it at a local server while developing.
+# [game]
+# url = "https://oh-no-more-agents.com/?full&fit"   # the default
+# url = "http://localhost:8788/?full&fit"
+# qml_bin = "/usr/lib/qt6/bin/qml"                  # Qt 6 qml runtime

@@ -321,7 +321,7 @@ QtObject {
     }
 
     function normalizeDashboards(value) {
-        var known = ["agents", "spotify", "basecamp", "slack", "github"]
+        var known = ["agents", "spotify", "basecamp", "slack", "github", "game"]
         var result = []
         if (Array.isArray(value)) {
             for (var index = 0; index < value.length; index += 1) {

@@ -16,6 +16,7 @@ QtObject {
         "basecamp_open",
         "slack_open",
         "github_open",
+        "game_show",
         "voice_start",
         "voice_stop",
         "voice_cancel",
@@ -60,6 +61,7 @@ QtObject {
             || action === "basecamp_open"
             || action === "slack_open"
             || action === "github_open"
+            || action === "game_show"
             || action === "voice_start"
             || action === "voice_stop"
             || action === "voice_cancel"

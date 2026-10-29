@@ -67,6 +67,11 @@ TestCase {
         property var basecampOpens: []
         property var slackOpens: []
         property var githubOpens: []
+        property int gameRequests: 0
+        function showGame() {
+            gameRequests += 1
+            return "game-" + gameRequests
+        }
         function openGithubItem(itemId) {
             githubOpens = githubOpens.concat([itemId])
             return "go"
@@ -181,6 +186,8 @@ TestCase {
         mockBridge.slackOpens = []
         mockStore.github = {"available": false}
         mockBridge.githubOpens = []
+        mockBridge.gameRequests = 0
+        portal.pendingGameRequest = ""
         mockStore.dashboards = ["agents"]
         mockStore.spotify = {"available": false}
         mockPreferences.dashboard = "agents"
@@ -337,6 +344,42 @@ TestCase {
         mockStore.desktopApps = []
         verify(spotifyTab.activate())
         compare(mockBridge.appRequests.spotify, 1)
+    }
+
+    function test_gameDashboardShowsOnlyTheHeaderAndPlacesItsWindow() {
+        mockStore.dashboards = ["agents", "game"]
+        wait(0)
+        var gameTab = findChild(portal, "dashboardTab_game")
+        compare(gameTab.label, "GAME")
+        compare(gameTab.detail, "TOUCH TO PLAY")
+        compare(portal.headerOnly, false)
+
+        verify(gameTab.activate())
+        compare(portal.currentDashboard, "game")
+        compare(portal.headerOnly, true)
+        compare(portal.headerBottom, 92)
+        verify(findChild(portal, "gameDashboard") !== null)
+        compare(findChild(portal, "gameStatus").text, "STARTING THE GAME")
+        compare(mockBridge.gameRequests, 1)
+
+        // One request at a time; the window is checked again after a launch.
+        verify(!portal.requestGame())
+        compare(mockBridge.gameRequests, 1)
+        mockStore.actionResultReceived({
+            "request_id": "game-1", "action": "game_show", "ok": true,
+            "code": "ok", "message": "game_launching"
+        })
+        compare(portal.pendingGameRequest, "")
+        tryCompare(mockBridge, "gameRequests", 2)
+
+        // The palette needs the full panel even over the game.
+        portal.paletteSettingsOpen = true
+        compare(portal.headerOnly, false)
+        portal.paletteSettingsOpen = false
+
+        verify(findChild(portal, "dashboardTab_agents").activate())
+        compare(portal.headerOnly, false)
+        compare(portal.currentDashboard, "agents")
     }
 
     function test_dashboardTabsOrderAndPageDotsFitBesideTheStatusRow() {

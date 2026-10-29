@@ -29,6 +29,7 @@
         "basecamp_open",
         "slack_open",
         "github_open",
+        "game_show",
         "voice_start",
         "voice_stop",
         "voice_cancel",
@@ -49,7 +50,7 @@
         "switchable": { "type": "boolean" }
       }
     },
-    "dashboard": { "enum": ["agents", "spotify", "basecamp", "slack", "github"] },
+    "dashboard": { "enum": ["agents", "spotify", "basecamp", "slack", "github", "game"] },
     "githubId": { "type": "string", "pattern": "^[pn][0-9]{1,20}$" },
     "github": {
       "type": "object",

@@ -32,6 +32,7 @@ pub struct Config {
     pub basecamp: BasecampConfig,
     pub slack: SlackConfig,
     pub github: GithubConfig,
+    pub game: GameConfig,
     pub t3code: T3codeConfig,
 }
 
@@ -91,6 +92,44 @@ struct DashboardsFile {
     slack: Option<SlackConfig>,
     #[serde(default)]
     github: Option<GithubConfig>,
+    #[serde(default)]
+    game: Option<GameConfig>,
+}
+
+pub const DEFAULT_GAME_URL: &str = "https://oh-no-more-agents.com/?full&fit";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GameConfig {
+    /// Page shown full-bleed by the game dashboard; http or https only.
+    pub url: String,
+    /// Qt 6 `qml` runtime that hosts the page. Quickshell cannot load
+    /// QtWebEngine itself, so the page runs in its own window.
+    pub qml_bin: PathBuf,
+}
+
+impl Default for GameConfig {
+    fn default() -> Self {
+        Self {
+            url: DEFAULT_GAME_URL.into(),
+            qml_bin: PathBuf::from("/usr/lib/qt6/bin/qml"),
+        }
+    }
+}
+
+/// An absolute http(s) URL without whitespace or control characters.
+fn is_game_url(url: &str) -> bool {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"));
+    url.len() <= 2048
+        && rest.is_some_and(|rest| {
+            !rest.is_empty()
+                && !rest.starts_with(['/', '?', '#'])
+                && !rest
+                    .chars()
+                    .any(|character| character.is_whitespace() || character.is_control())
+        })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -289,6 +328,7 @@ impl Default for Config {
             basecamp: BasecampConfig::default(),
             slack: SlackConfig::default(),
             github: GithubConfig::default(),
+            game: GameConfig::default(),
             t3code: T3codeConfig::default(),
         }
     }
@@ -359,6 +399,9 @@ impl Config {
             }
             if let Some(github) = file.github {
                 config.github = github;
+            }
+            if let Some(game) = file.game {
+                config.game = game;
             }
         }
         config.apply_runtime_output(runtime_output)?;
@@ -484,6 +527,12 @@ impl Config {
         {
             anyhow::bail!("github.user must be a GitHub login");
         }
+        if !is_game_url(&self.game.url) {
+            anyhow::bail!("game.url must be an http:// or https:// URL");
+        }
+        if self.game.qml_bin.as_os_str().is_empty() {
+            anyhow::bail!("game.qml_bin must not be empty");
+        }
         if self.slack.channels.len() > MAX_SLACK_CHANNELS {
             anyhow::bail!("slack.channels allows at most {MAX_SLACK_CHANNELS} channels");
         }
@@ -561,11 +610,19 @@ impl Config {
     }
 }
 
-fn default_config_path() -> Option<PathBuf> {
+fn config_home() -> Option<PathBuf> {
     env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-        .map(|root| root.join("xeneon-edge-agents/config.toml"))
+}
+
+fn default_config_path() -> Option<PathBuf> {
+    config_home().map(|root| root.join("xeneon-edge-agents/config.toml"))
+}
+
+/// The game dashboard's window, installed with the portal's Quickshell files.
+pub fn game_window_path() -> Option<PathBuf> {
+    config_home().map(|root| root.join("quickshell/xeneon-edge-agents/game/GameWindow.qml"))
 }
 
 #[cfg(test)]
@@ -735,6 +792,46 @@ mod tests {
 
         fs::write(&dashboards_path, "dashboards = [\"myspace\"]\n").unwrap();
         assert!(Config::load_with_runtime_output(Some(&config_path), None).is_err());
+    }
+
+    #[test]
+    fn game_dashboard_defaults_to_the_live_site_and_takes_only_web_urls() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.toml");
+        fs::write(&config_path, "").unwrap();
+        let dashboards_path = temp.path().join(DASHBOARDS_FILE_NAME);
+        fs::write(&dashboards_path, "dashboards = [\"agents\", \"game\"]\n").unwrap();
+        let loaded = Config::load_with_runtime_output(Some(&config_path), None).unwrap();
+        assert_eq!(
+            loaded.dashboards,
+            [DashboardKind::Agents, DashboardKind::Game]
+        );
+        assert_eq!(loaded.game.url, DEFAULT_GAME_URL);
+        loaded.validate().unwrap();
+
+        fs::write(
+            &dashboards_path,
+            "dashboards = [\"game\"]\n[game]\nurl = \"http://localhost:8788/?full&fit\"\n",
+        )
+        .unwrap();
+        let loaded = Config::load_with_runtime_output(Some(&config_path), None).unwrap();
+        assert_eq!(loaded.game.url, "http://localhost:8788/?full&fit");
+        assert_eq!(loaded.game.qml_bin, PathBuf::from("/usr/lib/qt6/bin/qml"));
+        loaded.validate().unwrap();
+
+        for url in [
+            "",
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "https://",
+            "https:///path",
+            "https://host/a b",
+            "https://host/\n",
+        ] {
+            let mut config = loaded.clone();
+            config.game.url = url.into();
+            assert!(config.validate().is_err(), "accepted: {url:?}");
+        }
     }
 
     #[test]

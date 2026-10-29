@@ -25,6 +25,11 @@ Item {
             ? String(preferences.dashboard)
             : dashboards[0]
     readonly property bool agentsDashboard: currentDashboard === "agents"
+    // The game page runs in its own window under the header; the live panel
+    // shrinks to the header while it is shown (see PortalPanel).
+    readonly property bool gameShown: currentDashboard === "game"
+    readonly property bool headerOnly: gameShown && !paletteSettingsOpen
+    readonly property real headerBottom: header.y + header.height
     // Fits "DESKTOP // AGENT COMMAND" (388 px); longer names elide.
     readonly property real identityTextWidth: 400
     // Grouped ordering renders one lane per workspace. Lanes keep the grid's
@@ -78,6 +83,7 @@ Item {
     property var pendingDesktopActions: ({})
     property string pendingAgentOrderRequest: ""
     property bool paletteSettingsOpen: false
+    property string pendingGameRequest: ""
     readonly property bool agentOrderAvailable:
         store.agentOrder !== undefined
         && store.agentOrder.available === true
@@ -182,6 +188,8 @@ Item {
             return "SLACK"
         if (dashboard === "github")
             return "GITHUB"
+        if (dashboard === "game")
+            return "GAME"
         return "AGENT COMMAND"
     }
 
@@ -211,6 +219,18 @@ Item {
         return true
     }
 
+    // Starts the game window when needed and places it under the header.
+    // Repeated while the game is shown so a closed or crashed window returns.
+    function requestGame() {
+        if (!gameShown || previewMode || !bridge.ready || pendingGameRequest !== "")
+            return false
+        var requestId = bridge.showGame()
+        if (requestId === "")
+            return false
+        pendingGameRequest = requestId
+        return true
+    }
+
     function dashboardDetail(dashboard) {
         if (dashboard === "spotify") {
             if (store.spotify.available !== true)
@@ -233,6 +253,8 @@ Item {
                 return "OFFLINE"
             return store.github.notifications.length + " UNREAD"
         }
+        if (dashboard === "game")
+            return "TOUCH TO PLAY"
         var order = pendingAgentOrderRequest !== ""
             ? "SYNCING · "
             : agentOrderAvailable ? agentOrderMode.toUpperCase() + " · " : ""
@@ -256,6 +278,8 @@ Item {
             return theme.magenta
         if (dashboard === "github")
             return theme.orange
+        if (dashboard === "game")
+            return theme.cyan
         return theme.accent
     }
 
@@ -1085,6 +1109,15 @@ Item {
             }
             if (result.action === "restore_focus")
                 return
+            // The game window has no toast: in the live panel only the
+            // header is on screen while it is shown.
+            if (result.action === "game_show") {
+                if (result.request_id === root.pendingGameRequest)
+                    root.pendingGameRequest = ""
+                if (result.ok && result.message !== "game_shown")
+                    gameRetry.restart()
+                return
+            }
             if (String(result.action).indexOf("spotify_") === 0) {
                 if (!result.ok)
                     root.showToast(
@@ -1135,6 +1168,7 @@ Item {
             if (root.store.freshSnapshotRequired) {
                 root.pendingDesktopActions = {}
                 root.pendingAgentOrderRequest = ""
+                root.pendingGameRequest = ""
             }
         }
     }
@@ -1248,6 +1282,38 @@ Item {
         onOpenRequested: function(itemId) {
             root.bridge.openGithubItem(itemId)
         }
+    }
+
+    GameView {
+        objectName: "gameDashboard"
+        anchors {
+            left: parent.left
+            right: parent.right
+            top: header.bottom
+            bottom: parent.bottom
+        }
+        visible: root.currentDashboard === "game"
+        theme: root.theme
+        previewMode: root.previewMode
+    }
+
+    onGameShownChanged: requestGame()
+
+    // A launch or a header resize takes a moment; check back soon, then
+    // keep a slow watch while the game is shown.
+    Timer {
+        id: gameRetry
+
+        interval: 600
+        onTriggered: root.requestGame()
+    }
+
+    Timer {
+        interval: 5000
+        repeat: true
+        running: root.gameShown && !root.previewMode
+        triggeredOnStart: true
+        onTriggered: root.requestGame()
     }
 
     // Other dashboards stay on screen instead of handing over to ambient.

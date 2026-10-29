@@ -16,10 +16,24 @@ Item {
 
     readonly property real designWidth: 2560
     readonly property real designHeight: 720
-    readonly property real viewportScale: Math.min(
-        width / designWidth,
-        height / designHeight
-    )
+    // True while only the header belongs on screen (the game dashboard); the
+    // panel then shrinks to headerHeight and the design keeps its width scale.
+    readonly property bool headerOnly: portalView.headerOnly
+    // Header height in logical pixels at a width-fitted scale, rounded up to
+    // whole device pixels so the window below it starts on a pixel row.
+    readonly property int headerHeight: {
+        var logical = portalView.headerBottom * width / designWidth
+        var ratio = devicePixelRatio > 0 ? devicePixelRatio : 1
+        for (var height = Math.ceil(logical); height < Math.ceil(logical) + 8; height += 1) {
+            if (Math.abs(height * ratio - Math.round(height * ratio)) < 0.001)
+                return height
+        }
+        return Math.ceil(logical)
+    }
+    property real devicePixelRatio: 1
+    readonly property real viewportScale: headerOnly
+        ? width / designWidth
+        : Math.min(width / designWidth, height / designHeight)
 
     clip: true
 
@@ -34,11 +48,13 @@ Item {
         width: root.designWidth
         height: root.designHeight
         x: (root.width - width * root.viewportScale) / 2
-        y: (root.height - height * root.viewportScale) / 2
+        y: root.headerOnly ? 0 : (root.height - height * root.viewportScale) / 2
         scale: root.viewportScale
         transformOrigin: Item.TopLeft
 
         PortalView {
+            id: portalView
+
             anchors.fill: parent
             store: root.store
             bridge: root.bridge

@@ -164,6 +164,10 @@ QtObject {
         return sendBuilt("desktop_app", "", "", store.sequence, appId)
     }
 
+    function showGame() {
+        return sendBuilt("game_show", "", "", store.sequence)
+    }
+
     function openGithubItem(itemId) {
         return sendBuilt("github_open", "", "", store.sequence, "", itemId)
     }

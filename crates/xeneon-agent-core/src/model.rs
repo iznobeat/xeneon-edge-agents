@@ -80,6 +80,7 @@ pub enum ActionKind {
     BasecampOpen,
     SlackOpen,
     GithubOpen,
+    GameShow,
     VoiceStart,
     VoiceStop,
     VoiceCancel,
@@ -99,6 +100,7 @@ pub enum DashboardKind {
     Basecamp,
     Slack,
     Github,
+    Game,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

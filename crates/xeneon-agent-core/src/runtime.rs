@@ -21,7 +21,8 @@ use uuid::Uuid;
 use crate::{
     Config,
     basecamp::{BasecampClient, is_basecamp_url},
-    desktop::{DesktopApp, DesktopAppOutcome, DesktopController},
+    config::game_window_path,
+    desktop::{DesktopApp, DesktopAppOutcome, DesktopController, GameOutcome},
     github::{GithubClient, is_github_url},
     health::HealthCollector,
     herdr::{HerdrClient, HerdrTarget, SessionDescriptor},
@@ -974,6 +975,43 @@ impl DaemonRuntime {
             };
         }
 
+        if command.action == ActionKind::GameShow {
+            if !self.config.dashboards.contains(&DashboardKind::Game) {
+                return action_error(
+                    &command.request_id,
+                    "target_unavailable",
+                    "the game dashboard is not enabled",
+                );
+            }
+            let Some(window_qml) = game_window_path() else {
+                return action_error(
+                    &command.request_id,
+                    "target_unavailable",
+                    "the game window path is unknown",
+                );
+            };
+            let game = &self.config.game;
+            return match self
+                .desktop
+                .show_game(&game.qml_bin, &window_qml, &game.url)
+                .await
+            {
+                Ok(GameOutcome::Placed) => action_ok(&command.request_id, "game_shown"),
+                Ok(GameOutcome::Launching) => action_ok(&command.request_id, "game_launching"),
+                Ok(GameOutcome::AwaitingHeader) => {
+                    action_ok(&command.request_id, "game_awaiting_header")
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "game window could not be shown");
+                    action_error(
+                        &command.request_id,
+                        "target_unavailable",
+                        "the game window could not be shown",
+                    )
+                }
+            };
+        }
+
         if command.action == ActionKind::GithubOpen {
             let url = {
                 let state = self.state.read().await;
@@ -1187,6 +1225,7 @@ impl DaemonRuntime {
             | ActionKind::BasecampOpen
             | ActionKind::SlackOpen
             | ActionKind::GithubOpen
+            | ActionKind::GameShow
             | ActionKind::VoiceStart
             | ActionKind::VoiceStop
             | ActionKind::VoiceCancel

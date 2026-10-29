@@ -2,6 +2,7 @@ local modulePath = assert(arg[1], "generated Hyprland module path is required")
 local deviceCalls = {}
 local commands = {}
 local subscriptions = {}
+local windowRules = {}
 
 hl = {
   device = function(spec)
@@ -12,6 +13,9 @@ hl = {
   end,
   on = function(event, callback)
     subscriptions[event] = callback
+  end,
+  window_rule = function(rule)
+    table.insert(windowRules, rule)
   end,
   timer = function()
     return {
@@ -47,3 +51,10 @@ assertDisabled(deviceCalls[3], "monitor removal")
 assert(#commands == 3, "monitor removal requested duplicate lifecycle retries")
 assert(commands[3]:match(" restart xeneon%-edge%-reconcile%.service$"),
   "monitor removal did not supersede an in-flight reconciliation")
+
+assert(#windowRules == 1, "the game window rule is missing")
+assert(windowRules[1].match.initial_title == "^xeneon-edge-game$",
+  "the game window rule matches the wrong window")
+assert(windowRules[1].float == true and windowRules[1].no_focus == true,
+  "the game window must float without taking focus")
+assert(not windowRules[1].monitor:match("@"), "the game window rule kept a placeholder")

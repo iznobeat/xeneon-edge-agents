@@ -27,12 +27,15 @@ PanelWindow {
     focusable: false
     mask: null
 
+    // While the game dashboard is shown the panel keeps only the header; the
+    // daemon places the game window in the rest of the screen.
     anchors {
         top: true
-        bottom: true
+        bottom: !viewport.headerOnly
         left: true
         right: true
     }
+    implicitHeight: viewport.headerOnly ? viewport.headerHeight : 0
 
     exclusionMode: ExclusionMode.Ignore
     WlrLayershell.layer: WlrLayer.Overlay
@@ -94,7 +97,11 @@ PanelWindow {
     }
 
     PortalViewport {
+        id: viewport
+
         anchors.fill: parent
+        // The window's fractional scale; the screen reports a rounded-up one.
+        devicePixelRatio: root.devicePixelRatio
         store: root.store
         bridge: root.bridge
         activity: root.activity

@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    ffi::OsStr,
     fs,
     path::{Path, PathBuf},
     process::Stdio,
@@ -16,12 +17,30 @@ use tokio::time::{sleep, timeout};
 use crate::config::DesktopConfig;
 
 const PORTAL_PREVIEW_CLASS_PREFIX: &str = "org.xeneon-edge.agent-portal-preview";
+/// Layer namespace of the live portal; its geometry tells the game window
+/// where the header ends.
+const PORTAL_LAYER_NAMESPACE: &str = "xeneon-edge-agent-portal";
+/// The game dashboard's window: Qt's `qml` runtime with a fixed title that the
+/// Hyprland module's window rule also matches.
+const GAME_WINDOW_CLASS: &str = "org.qt-project.qml";
+pub const GAME_WINDOW_TITLE: &str = "xeneon-edge-game";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DesktopApp {
     /// Index into the configured `desktop.apps` shortcuts.
     Configured(usize),
     T3code,
+    Game,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GameOutcome {
+    /// The window is mapped and sits under the portal header.
+    Placed,
+    /// The window was started or is still starting.
+    Launching,
+    /// The window exists but the portal has not shrunk to its header yet.
+    AwaitingHeader,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +85,10 @@ struct HyprClient {
     floating: bool,
     #[serde(default, rename = "focusHistoryID")]
     focus_history_id: Option<i64>,
+    #[serde(default)]
+    at: [i64; 2],
+    #[serde(default)]
+    size: [i64; 2],
 }
 
 #[derive(Debug, Deserialize)]
@@ -74,6 +97,44 @@ struct HyprMonitor {
     name: String,
     #[serde(default)]
     focused: bool,
+    #[serde(default)]
+    y: i64,
+    #[serde(default)]
+    width: i64,
+    #[serde(default)]
+    height: i64,
+    #[serde(default = "unit_scale")]
+    scale: f64,
+    #[serde(default)]
+    transform: i64,
+}
+
+fn unit_scale() -> f64 {
+    1.0
+}
+
+#[derive(Debug, Deserialize)]
+struct HyprLayerMonitor {
+    levels: HashMap<String, Vec<HyprLayer>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HyprLayer {
+    x: i64,
+    y: i64,
+    w: i64,
+    h: i64,
+    #[serde(default)]
+    namespace: String,
+}
+
+/// Global logical rectangle for the game window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GameArea {
+    x: i64,
+    y: i64,
+    width: i64,
+    height: i64,
 }
 
 impl DesktopController {
@@ -240,6 +301,78 @@ impl DesktopController {
             Some(client) => dispatch_focus(&self.hyprctl_bin, &client.address).await,
             None => bail!("no {} desktop client is mapped", spec.class),
         }
+    }
+
+    /// Starts the game window when it is missing and keeps it exactly under
+    /// the portal header. The portal shrinks its layer to the header while the
+    /// game dashboard is shown, so whatever the layer no longer covers on its
+    /// monitor is the game's area; the window floats there by window rule.
+    pub async fn show_game(
+        &self,
+        qml_bin: &Path,
+        window_qml: &Path,
+        url: &str,
+    ) -> Result<GameOutcome> {
+        let clients = hypr_json::<Vec<HyprClient>>(&self.hyprctl_bin, &["clients", "-j"]).await?;
+        let Some(window) = clients.iter().find(|client| is_game_client(client)) else {
+            let now = Instant::now();
+            let mut launches = self.launching_since.lock().await;
+            let launch_in_flight = launches
+                .get(&DesktopApp::Game)
+                .is_some_and(|started| now.duration_since(*started) < self.launch_coalesce_for);
+            if !launch_in_flight {
+                if !window_qml.is_file() {
+                    bail!("game window {} is not installed", window_qml.display());
+                }
+                launches.insert(DesktopApp::Game, now);
+                drop(launches);
+                if let Err(error) = launch_service(
+                    &self.uwsm_bin,
+                    &[
+                        qml_bin.as_os_str(),
+                        window_qml.as_os_str(),
+                        OsStr::new("--"),
+                        OsStr::new(url),
+                    ],
+                )
+                .await
+                {
+                    self.launching_since.lock().await.remove(&DesktopApp::Game);
+                    return Err(error);
+                }
+            }
+            return Ok(GameOutcome::Launching);
+        };
+        self.launching_since.lock().await.remove(&DesktopApp::Game);
+        let layers =
+            hypr_json::<HashMap<String, HyprLayerMonitor>>(&self.hyprctl_bin, &["layers", "-j"])
+                .await?;
+        let monitors =
+            hypr_json::<Vec<HyprMonitor>>(&self.hyprctl_bin, &["monitors", "-j"]).await?;
+        let Some(area) = game_area(&layers, &monitors, self.config.edge_output.as_deref()) else {
+            return Ok(GameOutcome::AwaitingHeader);
+        };
+        if window.at != [area.x, area.y] || window.size != [area.width, area.height] {
+            let selector = window_selector(&window.address)?;
+            // A resize keeps the window centered, so it goes before the move.
+            dispatch(
+                &self.hyprctl_bin,
+                &format!(
+                    "hl.dsp.window.resize({{ x = {}, y = {}, window = \"{selector}\" }})",
+                    area.width, area.height
+                ),
+            )
+            .await?;
+            dispatch(
+                &self.hyprctl_bin,
+                &format!(
+                    "hl.dsp.window.move({{ x = {}, y = {}, window = \"{selector}\" }})",
+                    area.x, area.y
+                ),
+            )
+            .await?;
+        }
+        Ok(GameOutcome::Placed)
     }
 
     pub async fn activate_herdr(&self, session: &str, socket_path: &Path) -> Result<()> {
@@ -419,21 +552,75 @@ fn desktop_app_spec(config: &DesktopConfig, app: DesktopApp) -> Result<DesktopAp
             class: "t3code",
             main_title: Some("T3 Code"),
         }),
+        DesktopApp::Game => bail!("the game window is not a desktop entry"),
     }
 }
 
+fn is_game_client(client: &HyprClient) -> bool {
+    (client.class == GAME_WINDOW_CLASS || client.initial_class == GAME_WINDOW_CLASS)
+        && client.initial_title == GAME_WINDOW_TITLE
+}
+
+/// The part of the portal's monitor below the portal layer, when the portal
+/// is shrunk to its header. A full-height portal yields nothing to place.
+fn game_area(
+    layers: &HashMap<String, HyprLayerMonitor>,
+    monitors: &[HyprMonitor],
+    edge_output: Option<&str>,
+) -> Option<GameArea> {
+    let mut portals = layers.iter().filter_map(|(monitor, levels)| {
+        levels
+            .levels
+            .values()
+            .flatten()
+            .find(|layer| layer.namespace == PORTAL_LAYER_NAMESPACE)
+            .map(|layer| (monitor.as_str(), layer))
+    });
+    let (monitor_name, portal) = portals.next()?;
+    if portals.next().is_some() || edge_output.is_some_and(|edge| edge != monitor_name) {
+        return None;
+    }
+    let monitor = monitors
+        .iter()
+        .find(|monitor| monitor.name == monitor_name)?;
+    if monitor.scale <= 0.0 {
+        return None;
+    }
+    let physical_height = if monitor.transform % 2 == 1 {
+        monitor.width
+    } else {
+        monitor.height
+    };
+    let bottom = monitor.y + (physical_height as f64 / monitor.scale).round() as i64;
+    let top = portal.y + portal.h;
+    (portal.y == monitor.y && portal.h > 0 && top < bottom && portal.w > 0).then_some(GameArea {
+        x: portal.x,
+        y: top,
+        width: portal.w,
+        height: bottom - top,
+    })
+}
+
 async fn launch_desktop(uwsm_bin: &Path, spec: DesktopAppSpec<'_>) -> Result<()> {
+    launch_service(uwsm_bin, &[OsStr::new(spec.desktop_id)])
+        .await
+        .with_context(|| format!("launching desktop entry {}", spec.desktop_id))
+}
+
+/// Runs a desktop entry or command line as its own graphical service.
+async fn launch_service(uwsm_bin: &Path, command: &[&OsStr]) -> Result<()> {
     let mut child = Command::new(uwsm_bin)
         // Bypass uwsm-app's runtime-directory lock/FIFO wrapper: the daemon's
         // sandbox can read the UWSM pipes but may only write its owned runtime
         // directory. A graphical service also avoids moving this already
         // service-owned caller into a scope.
-        .args(["app", "-t", "service", "--", spec.desktop_id])
+        .args(["app", "-t", "service", "--"])
+        .args(command)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .with_context(|| format!("launching desktop entry {}", spec.desktop_id))?;
+        .context("launching graphical service")?;
 
     match timeout(Duration::from_millis(500), child.wait()).await {
         Ok(status) => {
@@ -484,18 +671,23 @@ async fn hypr_json<T: for<'de> Deserialize<'de>>(hyprctl_bin: &Path, args: &[&st
 }
 
 async fn dispatch_focus(hyprctl_bin: &Path, address: &str) -> Result<()> {
-    let expression = focus_expression(address)?;
+    dispatch(hyprctl_bin, &focus_expression(address)?)
+        .await
+        .context("restoring Hyprland focus")
+}
+
+async fn dispatch(hyprctl_bin: &Path, expression: &str) -> Result<()> {
     let output = Command::new(hyprctl_bin)
-        .args(["dispatch", &expression])
+        .args(["dispatch", expression])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
         .await
-        .context("restoring Hyprland focus")?;
+        .context("running a Hyprland dispatch")?;
     if !output.status.success() {
         bail!(
-            "Hyprland focus dispatch failed: stdout={} stderr={}",
+            "Hyprland dispatch failed: stdout={} stderr={}",
             String::from_utf8_lossy(&output.stdout).trim(),
             String::from_utf8_lossy(&output.stderr).trim(),
         );
@@ -504,15 +696,20 @@ async fn dispatch_focus(hyprctl_bin: &Path, address: &str) -> Result<()> {
 }
 
 fn focus_expression(address: &str) -> Result<String> {
+    Ok(format!(
+        "hl.dsp.focus({{ window = \"{}\" }})",
+        window_selector(address)?
+    ))
+}
+
+fn window_selector(address: &str) -> Result<String> {
     let Some(hex) = address.strip_prefix("0x") else {
         bail!("Hyprland window address lacks 0x prefix");
     };
     if hex.is_empty() || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         bail!("Hyprland window address is not hexadecimal");
     }
-    Ok(format!(
-        "hl.dsp.focus({{ window = \"address:{address}\" }})"
-    ))
+    Ok(format!("address:{address}"))
 }
 
 fn client_hosts_session_in(
@@ -1116,6 +1313,74 @@ mod tests {
         );
         assert!(focus_expression("title:herdr").is_err());
         assert!(focus_expression("0x1\" })").is_err());
+    }
+
+    fn edge_layers(portal_height: i64) -> HashMap<String, HyprLayerMonitor> {
+        serde_json::from_value(serde_json::json!({
+            "DP-2": {"levels": {
+                "2": [{"x": 0, "y": 1152, "w": 2048, "h": 26, "namespace": "omarchy-bar"}],
+                "3": [{"x": 0, "y": 1152, "w": 2048, "h": portal_height,
+                       "namespace": "xeneon-edge-agent-portal"}]
+            }},
+            "DP-1": {"levels": {
+                "2": [{"x": 0, "y": 0, "w": 2048, "h": 26, "namespace": "omarchy-bar"}]
+            }}
+        }))
+        .unwrap()
+    }
+
+    fn edge_monitors() -> Vec<HyprMonitor> {
+        serde_json::from_value(serde_json::json!([
+            {"id": 0, "name": "DP-1", "y": 0, "width": 2560, "height": 1440, "scale": 1.25},
+            {"id": 1, "name": "DP-2", "y": 1152, "width": 2560, "height": 720,
+             "scale": 1.25, "transform": 0}
+        ]))
+        .unwrap()
+    }
+
+    #[test]
+    fn game_area_is_the_edge_below_the_shrunk_portal_header() {
+        assert_eq!(
+            game_area(&edge_layers(76), &edge_monitors(), Some("DP-2")),
+            Some(GameArea {
+                x: 0,
+                y: 1228,
+                width: 2048,
+                height: 500,
+            })
+        );
+        // A full-height portal covers the game; nothing is placed.
+        assert_eq!(
+            game_area(&edge_layers(576), &edge_monitors(), Some("DP-2")),
+            None
+        );
+        // Only the configured EDGE output hosts the game.
+        assert_eq!(
+            game_area(&edge_layers(76), &edge_monitors(), Some("DP-1")),
+            None
+        );
+    }
+
+    #[test]
+    fn game_client_needs_the_qml_runtime_class_and_fixed_title() {
+        let client = |class: &str, title: &str| -> HyprClient {
+            serde_json::from_value(serde_json::json!({
+                "address": "0x1", "class": class, "initialClass": class,
+                "title": "page", "initialTitle": title, "pid": 1, "monitor": 1,
+                "at": [0, 1228], "size": [2048, 500]
+            }))
+            .unwrap()
+        };
+        assert!(is_game_client(&client(
+            "org.qt-project.qml",
+            "xeneon-edge-game"
+        )));
+        assert!(!is_game_client(&client("org.qt-project.qml", "other")));
+        assert!(!is_game_client(&client("chromium", "xeneon-edge-game")));
+        assert_eq!(
+            client("org.qt-project.qml", "xeneon-edge-game").size,
+            [2048, 500]
+        );
     }
 
     #[test]

@@ -63,6 +63,7 @@ pub fn validate_command(command: &PortalCommand) -> Result<(), CommandError> {
         | ActionKind::BasecampOpen
         | ActionKind::SlackOpen
         | ActionKind::GithubOpen
+        | ActionKind::GameShow
         | ActionKind::VoiceStart
         | ActionKind::VoiceStop
         | ActionKind::VoiceCancel
