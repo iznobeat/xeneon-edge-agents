@@ -691,6 +691,27 @@ Item {
                     Text {
                         id: label
 
+                        // Where wrapping put each row, so the fill can run
+                        // through the rows in order rather than across all
+                        // of them at once.
+                        property var rows: []
+                        property var laidOut: []
+                        readonly property real rowsWidth: rows.reduce(
+                            function(total, row) { return total + row.width }, 0
+                        )
+
+                        onLineLaidOut: (line) => {
+                            if (line.number === 0)
+                                laidOut = []
+                            laidOut.push({
+                                "y": line.y,
+                                "height": line.height,
+                                "width": line.implicitWidth
+                            })
+                            if (line.isLast)
+                                rows = laidOut
+                        }
+
                         width: parent.width
                         text: !lyricRow.gap
                             ? String(lyricRow.modelData.text)
@@ -710,21 +731,38 @@ Item {
                         }
                     }
 
-                    // The sung part of the line in the accent colour.
-                    Item {
-                        objectName: "spotifyLyricFill"
-                        width: label.contentWidth * lyricRow.fill
-                        height: label.height
-                        clip: true
-                        visible: lyricRow.current
+                    // The sung part of the line in the accent colour, one clip
+                    // per row: a row fills only once the rows above it have.
+                    Repeater {
+                        model: lyricRow.current ? label.rows : []
 
-                        Text {
-                            width: label.width
-                            text: label.text
-                            textFormat: Text.PlainText
-                            wrapMode: Text.WordWrap
-                            color: root.readableAccent
-                            font: label.font
+                        delegate: Item {
+                            id: fillRow
+
+                            required property var modelData
+                            required property int index
+                            readonly property real before: label.rows
+                                .slice(0, index)
+                                .reduce(function(total, row) { return total + row.width }, 0)
+
+                            objectName: "spotifyLyricFill"
+                            y: modelData.y
+                            width: Math.max(0, Math.min(
+                                modelData.width,
+                                lyricRow.fill * label.rowsWidth - before
+                            ))
+                            height: modelData.height
+                            clip: true
+
+                            Text {
+                                y: -fillRow.y
+                                width: label.width
+                                text: label.text
+                                textFormat: Text.PlainText
+                                wrapMode: Text.WordWrap
+                                color: root.readableAccent
+                                font: label.font
+                            }
                         }
                     }
 
