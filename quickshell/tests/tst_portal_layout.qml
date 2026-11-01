@@ -506,6 +506,12 @@ TestCase {
         wait(0)
         verify(list.model === model)
 
+        // The sung line fills from its start toward the next line's start.
+        mockStore.spotify = Object.assign({}, mockStore.spotify, {"position_ms": 38460})
+        wait(0)
+        compare(list.currentIndex, 1)
+        fuzzyCompare(list.currentItem.lineProgress, 0.5, 0.01)
+
         mockStore.spotify = Object.assign({}, mockStore.spotify, {"position_ms": 60000})
         wait(0)
         compare(view.activeLine, 2)

@@ -49,6 +49,8 @@ Item {
         : lyrics.title === spotify.title && lyrics.artist === spotify.artist
             ? lyrics.status
             : "loading"
+    // Decorative motion runs only while the dashboard is on screen.
+    readonly property bool animated: visible && !reducedMotion
     readonly property bool lyricsReady: (lyricsState === "synced"
         || lyricsState === "plain") && lyricLines.length > 0
 
@@ -70,6 +72,8 @@ Item {
             return
         lyricsKey = key
         lyricLines = lines
+        if (lines.length > 0 && animated)
+            lyricsIntro.restart()
     }
 
     onLyricsChanged: syncLyrics()
@@ -287,6 +291,54 @@ Item {
                         pixelSize: 12
                         weight: Font.DemiBold
                         letterSpacing: 0.8
+                    }
+                }
+            }
+
+            // A small equalizer that bounces while music plays.
+            Row {
+                objectName: "spotifyEqualizer"
+                anchors.verticalCenter: parent.verticalCenter
+                height: 20
+                spacing: 3
+                visible: root.playing
+
+                Repeater {
+                    model: 4
+
+                    delegate: Item {
+                        id: bar
+
+                        required property int index
+                        property real level: 0.3
+
+                        width: 4
+                        height: 20
+
+                        Rectangle {
+                            anchors.bottom: parent.bottom
+                            width: parent.width
+                            height: 4 + 16 * bar.level
+                            radius: 2
+                            color: root.accent
+                        }
+
+                        SequentialAnimation on level {
+                            running: root.playing && root.animated
+                            loops: Animation.Infinite
+                            onRunningChanged: if (!running) bar.level = 0.3
+
+                            NumberAnimation {
+                                to: [0.9, 0.6, 1, 0.75][bar.index]
+                                duration: [310, 240, 380, 270][bar.index]
+                                easing.type: Easing.InOutSine
+                            }
+                            NumberAnimation {
+                                to: [0.15, 0.35, 0.2, 0.1][bar.index]
+                                duration: [290, 360, 250, 330][bar.index]
+                                easing.type: Easing.InOutSine
+                            }
+                        }
                     }
                 }
             }
@@ -543,41 +595,168 @@ Item {
             preferredHighlightEnd: preferredHighlightBegin
                 + (currentItem ? currentItem.height : 40)
             highlightFollowsCurrentItem: true
-            highlightMoveDuration: root.reducedMotion ? 0 : 420
+            highlightMoveDuration: root.reducedMotion ? 0 : 520
             onMovementStarted: root.interacted()
+            transform: Translate { id: lyricShift }
 
-            delegate: Text {
+            // New lyrics fade and slide up into place.
+            ParallelAnimation {
+                id: lyricsIntro
+
+                NumberAnimation {
+                    target: lyricList
+                    property: "opacity"
+                    from: 0
+                    to: 1
+                    duration: 520
+                    easing.type: Easing.OutCubic
+                }
+                NumberAnimation {
+                    target: lyricShift
+                    property: "y"
+                    from: 36
+                    to: 0
+                    duration: 620
+                    easing.type: Easing.OutCubic
+                }
+            }
+
+            delegate: Item {
+                id: lyricRow
+
                 required property var modelData
                 required property int index
 
                 readonly property bool synced: root.lyricsState === "synced"
                 readonly property bool current: synced && index === root.activeLine
+                readonly property bool gap: String(modelData.text || "") === ""
                 readonly property int distance: Math.abs(
                     index - Math.max(0, root.activeLine)
                 )
+                // How far the song is through this line, up to where the
+                // next one starts; drives the karaoke fill.
+                readonly property real lineProgress: {
+                    if (!current)
+                        return 0
+                    var start = Number(modelData.at_ms)
+                    var lines = root.lyricLines
+                    var end = index + 1 < lines.length
+                        ? Number(lines[index + 1].at_ms)
+                        : root.lengthMs
+                    return Math.max(0, Math.min(
+                        1,
+                        (root.positionMs - start) / Math.max(1, end - start)
+                    ))
+                }
+                // Follows lineProgress smoothly between the view's
+                // quarter-second position updates.
+                property real fill: lineProgress
+
+                Behavior on fill {
+                    enabled: lyricRow.current && root.animated
+                    NumberAnimation {
+                        duration: 250
+                        easing.type: Easing.Linear
+                    }
+                }
 
                 width: ListView.view.width
-                text: String(modelData.text || "") !== ""
-                    ? String(modelData.text)
-                    : synced ? "\u266a" : " "
-                textFormat: Text.PlainText
-                wrapMode: Text.WordWrap
-                color: current ? root.readablePrimary : root.readableMuted
+                height: Math.ceil(lineBox.height * lineBox.scale)
                 opacity: !synced ? 1 : current ? 1 : Math.max(0.3, 0.9 - distance * 0.16)
-                font {
-                    family: "monospace"
-                    pixelSize: current ? 30 : 24
-                    weight: current ? Font.Bold : Font.Medium
-                }
 
                 Behavior on opacity {
                     enabled: !root.reducedMotion
-                    NumberAnimation { duration: 240 }
+                    NumberAnimation { duration: 320 }
+                }
+
+                // Every line is laid out at the sung size and scaled down
+                // when it is not the one being sung, so growing into place
+                // is a smooth scale rather than a jump in font size.
+                Item {
+                    id: lineBox
+
+                    width: lyricRow.width / scale
+                    height: label.implicitHeight
+                    transformOrigin: Item.TopLeft
+                    scale: !lyricRow.synced || lyricRow.current ? 1 : 0.8
+
+                    Behavior on scale {
+                        enabled: !root.reducedMotion
+                        NumberAnimation {
+                            duration: 380
+                            easing.type: Easing.OutCubic
+                        }
+                    }
+
+                    Text {
+                        id: label
+
+                        width: parent.width
+                        text: !lyricRow.gap
+                            ? String(lyricRow.modelData.text)
+                            : lyricRow.synced ? "\u25cf  \u25cf  \u25cf" : " "
+                        textFormat: Text.PlainText
+                        wrapMode: Text.WordWrap
+                        color: lyricRow.current ? root.readablePrimary : root.readableMuted
+                        font {
+                            family: "monospace"
+                            pixelSize: lyricRow.synced ? 30 : 24
+                            weight: Font.DemiBold
+                        }
+
+                        Behavior on color {
+                            enabled: !root.reducedMotion
+                            ColorAnimation { duration: 320 }
+                        }
+                    }
+
+                    // The sung part of the line in the accent colour.
+                    Item {
+                        objectName: "spotifyLyricFill"
+                        width: label.contentWidth * lyricRow.fill
+                        height: label.height
+                        clip: true
+                        visible: lyricRow.current
+
+                        Text {
+                            width: label.width
+                            text: label.text
+                            textFormat: Text.PlainText
+                            wrapMode: Text.WordWrap
+                            color: root.readableAccent
+                            font: label.font
+                        }
+                    }
+
+                    // An instrumental break breathes while it lasts.
+                    SequentialAnimation {
+                        running: lyricRow.current && lyricRow.gap && root.playing
+                            && root.animated
+                        loops: Animation.Infinite
+                        onRunningChanged: if (!running) lineBox.opacity = 1
+
+                        NumberAnimation {
+                            target: lineBox
+                            property: "opacity"
+                            to: 0.55
+                            duration: 700
+                            easing.type: Easing.InOutSine
+                        }
+                        NumberAnimation {
+                            target: lineBox
+                            property: "opacity"
+                            to: 1
+                            duration: 700
+                            easing.type: Easing.InOutSine
+                        }
+                    }
                 }
             }
         }
 
         Text {
+            id: lyricsStatus
+
             objectName: "spotifyLyricsStatus"
             anchors {
                 left: parent.left
@@ -586,6 +765,17 @@ Item {
             }
             visible: root.lyricsShown && !root.lyricsReady
             horizontalAlignment: Text.AlignHCenter
+
+            // Breathes while a lookup is under way.
+            SequentialAnimation on opacity {
+                running: root.animated && (root.lyricsState === "loading"
+                    || root.lyricsState === "unavailable")
+                loops: Animation.Infinite
+                onRunningChanged: if (!running) lyricsStatus.opacity = 1
+
+                NumberAnimation { to: 0.4; duration: 900; easing.type: Easing.InOutSine }
+                NumberAnimation { to: 1; duration: 900; easing.type: Easing.InOutSine }
+            }
             text: root.lyricsState === "instrumental"
                 ? "INSTRUMENTAL"
                 : root.lyricsState === "missing"
