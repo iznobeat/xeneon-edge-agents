@@ -131,6 +131,42 @@ pub struct SpotifySnapshot {
     pub can_go_previous: bool,
 }
 
+/// How far the lyrics lookup for the current Spotify track got.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LyricsStatus {
+    /// Lyrics are switched off or nothing is playing.
+    #[default]
+    Off,
+    Loading,
+    /// Lines carry the time they start at.
+    Synced,
+    /// Lines carry no times (`at_ms` is 0).
+    Plain,
+    Instrumental,
+    /// The lyrics service has nothing for this track.
+    Missing,
+    /// The lookup failed; it is retried later.
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LyricLine {
+    pub at_ms: u64,
+    pub text: String,
+}
+
+/// Lyrics for the track named by `title` and `artist`, which the portal
+/// matches against the Spotify snapshot before showing them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LyricsSnapshot {
+    pub status: LyricsStatus,
+    pub title: String,
+    pub artist: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lines: Vec<LyricLine>,
+}
+
 /// One unread item from the Basecamp Hey! inbox. Its URL stays in the
 /// daemon; the portal opens it by `id` with `basecamp_open`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -562,6 +598,10 @@ pub struct PortalSnapshot {
     /// Populated only while the Spotify dashboard is enabled.
     #[serde(default)]
     pub spotify: SpotifySnapshot,
+    /// Lyrics for the playing track, while the Spotify dashboard is enabled
+    /// and `spotify.lyrics` is on.
+    #[serde(default)]
+    pub lyrics: LyricsSnapshot,
     /// Populated only while the Basecamp dashboard is enabled.
     #[serde(default)]
     pub basecamp: BasecampSnapshot,
@@ -599,6 +639,7 @@ impl PortalSnapshot {
             desktop_apps: Vec::new(),
             dashboards: vec![DashboardKind::Agents],
             spotify: SpotifySnapshot::default(),
+            lyrics: LyricsSnapshot::default(),
             basecamp: BasecampSnapshot::default(),
             slack: SlackSnapshot::default(),
             github: GithubSnapshot::default(),

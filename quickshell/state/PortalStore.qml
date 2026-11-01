@@ -35,6 +35,8 @@ QtObject {
     // Enabled dashboards in order; the daemon always lists at least one.
     property var dashboards: ["agents"]
     property var spotify: ({"available": false})
+    // Lyrics for the track named by its title and artist.
+    property var lyrics: ({"status": "off", "title": "", "artist": "", "lines": []})
     property var basecamp: ({"available": false})
     property var slack: ({"available": false})
     property var github: ({"available": false})
@@ -120,6 +122,7 @@ QtObject {
         desktopApps = []
         dashboards = ["agents"]
         spotify = {"available": false}
+        lyrics = normalizeLyrics(null)
         basecamp = {"available": false}
         slack = {"available": false}
         github = {"available": false}
@@ -356,6 +359,38 @@ QtObject {
             "can_control": value.can_control === true,
             "can_go_next": value.can_go_next === true,
             "can_go_previous": value.can_go_previous === true
+        }
+    }
+
+    function normalizeLyrics(value) {
+        var off = {"status": "off", "title": "", "artist": "", "lines": []}
+        if (value === null || typeof value !== "object")
+            return off
+        var statuses = [
+            "loading", "synced", "plain", "instrumental", "missing",
+            "unavailable"
+        ]
+        var status = safeString(value.status, "off", 16)
+        if (statuses.indexOf(status) === -1)
+            return off
+        var lines = []
+        var raw = Array.isArray(value.lines) ? value.lines.slice(0, 400) : []
+        for (var index = 0; index < raw.length; index += 1) {
+            var line = raw[index]
+            if (line === null || typeof line !== "object")
+                continue
+            lines.push({
+                "at_ms": status === "synced"
+                    ? Math.max(0, finiteNumber(line.at_ms, 0))
+                    : 0,
+                "text": safeString(line.text, "", 200)
+            })
+        }
+        return {
+            "status": status,
+            "title": safeString(value.title, "", 160),
+            "artist": safeString(value.artist, "", 160),
+            "lines": lines
         }
     }
 
@@ -1052,6 +1087,7 @@ QtObject {
         desktopApps = normalizeDesktopApps(snapshot.desktop_apps)
         dashboards = normalizeDashboards(snapshot.dashboards)
         spotify = normalizeSpotify(snapshot.spotify)
+        lyrics = normalizeLyrics(snapshot.lyrics)
         basecamp = normalizeBasecamp(snapshot.basecamp)
         slack = normalizeSlack(snapshot.slack)
         github = normalizeGithub(snapshot.github)

@@ -2,12 +2,14 @@ import QtQuick
 import QtQuick.Effects
 import "../state/ThemePalette.js" as ThemePalette
 
-// Now-playing dashboard. It renders the daemon's Spotify snapshot and asks
-// for one of three typed controls; it never talks to Spotify itself.
+// Now-playing dashboard. It renders the daemon's Spotify snapshot and
+// lyrics and asks for one of three typed controls; it never talks to Spotify
+// or the lyrics service itself.
 Item {
     id: root
 
     property var spotify: ({"available": false})
+    property var lyrics: ({"status": "off", "title": "", "artist": "", "lines": []})
     property var theme: ThemePalette.fallback
     property bool reducedMotion: false
     property bool canOpenSpotify: false
@@ -38,6 +40,67 @@ Item {
         4.5
     )
 
+    // The pane shows while lyrics are on; until the daemon has caught up
+    // with a track change the lyrics it holds are for the previous track.
+    readonly property bool lyricsShown: available && lyrics !== null
+        && lyrics !== undefined && lyrics.status !== "off"
+    readonly property string lyricsState: !lyricsShown
+        ? "off"
+        : lyrics.title === spotify.title && lyrics.artist === spotify.artist
+            ? lyrics.status
+            : "loading"
+    readonly property bool lyricsReady: (lyricsState === "synced"
+        || lyricsState === "plain") && lyricLines.length > 0
+
+    // Every snapshot delivers a new lyrics object; the list is replaced only
+    // when the lyrics differ, or it would jump back to the top each second.
+    property var lyricLines: []
+    property string lyricsKey: ""
+
+    function syncLyrics() {
+        // Values set at creation arrive as a list, not a JS array.
+        var lines = lyrics && lyrics.lines && lyrics.lines.length !== undefined
+            ? Array.prototype.slice.call(lyrics.lines)
+            : []
+        var key = lyrics
+            ? [lyrics.status, lyrics.title, lyrics.artist,
+               JSON.stringify(lines)].join("\u0000")
+            : ""
+        if (key === lyricsKey)
+            return
+        lyricsKey = key
+        lyricLines = lines
+    }
+
+    onLyricsChanged: syncLyrics()
+    // Change handlers do not run for the values a view is created with.
+    Component.onCompleted: {
+        syncSample()
+        syncLyrics()
+    }
+
+    // The synced line being sung: the last one that has started, looking a
+    // little ahead so the highlight lands with the voice rather than after.
+    readonly property int activeLine: {
+        if (lyricsState !== "synced")
+            return -1
+        var lines = lyricLines
+        var at = positionMs + 200
+        var low = 0
+        var high = lines.length - 1
+        var found = -1
+        while (low <= high) {
+            var middle = (low + high) >> 1
+            if (Number(lines[middle].at_ms) <= at) {
+                found = middle
+                low = middle + 1
+            } else {
+                high = middle - 1
+            }
+        }
+        return found
+    }
+
     // The daemon publishes position only on track, state, or seek changes;
     // between snapshots the bar advances from the last sampled position.
     property double sampledPositionMs: 0
@@ -56,7 +119,9 @@ Item {
     // would snap back to the last sampled position each time.
     property string sampleKey: ""
 
-    onSpotifyChanged: {
+    onSpotifyChanged: syncSample()
+
+    function syncSample() {
         // Read the new value directly: `available` may not have re-evaluated
         // yet when this handler runs.
         var live = spotify !== null && spotify !== undefined
@@ -164,7 +229,7 @@ Item {
 
         anchors {
             left: art.right
-            right: parent.right
+            right: root.lyricsShown ? lyricsPane.left : parent.right
             top: parent.top
             bottom: parent.bottom
             leftMargin: 44
@@ -240,6 +305,8 @@ Item {
             text: root.available ? String(root.spotify.title || "") : ""
             textFormat: Text.PlainText
             color: root.readablePrimary
+            wrapMode: Text.WordWrap
+            maximumLineCount: 2
             elide: Text.ElideRight
             font {
                 family: "monospace"
@@ -400,6 +467,139 @@ Item {
                     && root.spotify.can_go_next
                 onInteracted: root.interacted()
                 onTriggered: root.nextRequested()
+            }
+        }
+    }
+
+    Item {
+        id: lyricsPane
+
+        objectName: "spotifyLyricsPane"
+        anchors {
+            right: parent.right
+            top: parent.top
+            bottom: parent.bottom
+            rightMargin: 36
+            topMargin: 34
+            bottomMargin: 30
+        }
+        width: Math.round(root.width * 0.42)
+        visible: root.lyricsShown
+
+        Rectangle {
+            anchors {
+                left: parent.left
+                top: parent.top
+                bottom: parent.bottom
+                leftMargin: -22
+            }
+            width: 1
+            color: Qt.alpha(root.accent, 0.2)
+        }
+
+        Text {
+            id: lyricsLabel
+
+            height: 28
+            verticalAlignment: Text.AlignVCenter
+            text: root.lyricsState === "plain"
+                ? "LYRICS  //  NOT TIME-SYNCED"
+                : "LYRICS"
+            textFormat: Text.PlainText
+            color: root.readableMuted
+            font {
+                family: "monospace"
+                pixelSize: 13
+                weight: Font.DemiBold
+                letterSpacing: 0.8
+            }
+        }
+
+        ListView {
+            id: lyricList
+
+            objectName: "spotifyLyrics"
+            anchors {
+                left: parent.left
+                right: parent.right
+                top: lyricsLabel.bottom
+                bottom: parent.bottom
+                topMargin: 18
+            }
+            clip: true
+            visible: root.lyricsReady
+            model: root.lyricsReady ? root.lyricLines : []
+            spacing: 14
+            boundsBehavior: Flickable.StopAtBounds
+            // Synced lyrics follow the song; plain ones scroll by touch.
+            interactive: root.lyricsState === "plain"
+            currentIndex: root.lyricsState === "synced"
+                ? Math.max(0, root.activeLine)
+                : -1
+            highlightRangeMode: root.lyricsState === "synced"
+                ? ListView.StrictlyEnforceRange
+                : ListView.NoHighlightRange
+            preferredHighlightBegin: Math.round(height * 0.32)
+            preferredHighlightEnd: preferredHighlightBegin
+                + (currentItem ? currentItem.height : 40)
+            highlightFollowsCurrentItem: true
+            highlightMoveDuration: root.reducedMotion ? 0 : 420
+            onMovementStarted: root.interacted()
+
+            delegate: Text {
+                required property var modelData
+                required property int index
+
+                readonly property bool synced: root.lyricsState === "synced"
+                readonly property bool current: synced && index === root.activeLine
+                readonly property int distance: Math.abs(
+                    index - Math.max(0, root.activeLine)
+                )
+
+                width: ListView.view.width
+                text: String(modelData.text || "") !== ""
+                    ? String(modelData.text)
+                    : synced ? "\u266a" : " "
+                textFormat: Text.PlainText
+                wrapMode: Text.WordWrap
+                color: current ? root.readablePrimary : root.readableMuted
+                opacity: !synced ? 1 : current ? 1 : Math.max(0.3, 0.9 - distance * 0.16)
+                font {
+                    family: "monospace"
+                    pixelSize: current ? 30 : 24
+                    weight: current ? Font.Bold : Font.Medium
+                }
+
+                Behavior on opacity {
+                    enabled: !root.reducedMotion
+                    NumberAnimation { duration: 240 }
+                }
+            }
+        }
+
+        Text {
+            objectName: "spotifyLyricsStatus"
+            anchors {
+                left: parent.left
+                right: parent.right
+                verticalCenter: lyricList.verticalCenter
+            }
+            visible: root.lyricsShown && !root.lyricsReady
+            horizontalAlignment: Text.AlignHCenter
+            text: root.lyricsState === "instrumental"
+                ? "INSTRUMENTAL"
+                : root.lyricsState === "missing"
+                    ? "NO LYRICS FOR THIS TRACK"
+                    : root.lyricsState === "unavailable"
+                        ? "LYRICS UNAVAILABLE  //  RETRYING"
+                        : "LOOKING FOR LYRICS"
+            textFormat: Text.PlainText
+            color: root.readableMuted
+            font {
+                family: "monospace"
+                pixelSize: 18
+                weight: Font.DemiBold
+                letterSpacing: 1
             }
         }
     }

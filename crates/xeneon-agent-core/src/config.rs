@@ -29,6 +29,7 @@ pub struct Config {
     /// Enabled dashboards in switcher order. Usually set per machine in
     /// `dashboards.toml` beside this file.
     pub dashboards: Vec<DashboardKind>,
+    pub spotify: SpotifyConfig,
     pub basecamp: BasecampConfig,
     pub slack: SlackConfig,
     pub github: GithubConfig,
@@ -87,6 +88,8 @@ pub const MAX_DASHBOARDS: usize = 6;
 struct DashboardsFile {
     dashboards: Vec<DashboardKind>,
     #[serde(default)]
+    spotify: Option<SpotifyConfig>,
+    #[serde(default)]
     basecamp: Option<BasecampConfig>,
     #[serde(default)]
     slack: Option<SlackConfig>,
@@ -94,6 +97,20 @@ struct DashboardsFile {
     github: Option<GithubConfig>,
     #[serde(default)]
     game: Option<GameConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SpotifyConfig {
+    /// Look up lyrics for the playing track on LRCLIB (lrclib.net), which
+    /// then learns the title, artist, album, and length of what plays.
+    pub lyrics: bool,
+}
+
+impl Default for SpotifyConfig {
+    fn default() -> Self {
+        Self { lyrics: true }
+    }
 }
 
 pub const DEFAULT_GAME_URL: &str = "https://oh-no-more-agents.com/?full&fit";
@@ -325,6 +342,7 @@ impl Default for Config {
             screen: ScreenConfig::default(),
             desktop: DesktopConfig::default(),
             dashboards: vec![DashboardKind::Agents],
+            spotify: SpotifyConfig::default(),
             basecamp: BasecampConfig::default(),
             slack: SlackConfig::default(),
             github: GithubConfig::default(),
@@ -386,6 +404,9 @@ impl Config {
             let file: DashboardsFile = toml::from_str(&contents)
                 .with_context(|| format!("parsing {}", dashboards_path.display()))?;
             config.dashboards = file.dashboards;
+            if let Some(spotify) = file.spotify {
+                config.spotify = spotify;
+            }
             if let Some(basecamp) = file.basecamp {
                 config.basecamp = basecamp;
             }
@@ -832,6 +853,25 @@ mod tests {
             config.game.url = url.into();
             assert!(config.validate().is_err(), "accepted: {url:?}");
         }
+    }
+
+    #[test]
+    fn spotify_lyrics_are_on_unless_switched_off() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.toml");
+        fs::write(&config_path, "").unwrap();
+        let dashboards_path = temp.path().join(DASHBOARDS_FILE_NAME);
+        fs::write(&dashboards_path, "dashboards = [\"spotify\"]\n").unwrap();
+        let loaded = Config::load_with_runtime_output(Some(&config_path), None).unwrap();
+        assert!(loaded.spotify.lyrics);
+
+        fs::write(
+            &dashboards_path,
+            "dashboards = [\"spotify\"]\n[spotify]\nlyrics = false\n",
+        )
+        .unwrap();
+        let loaded = Config::load_with_runtime_output(Some(&config_path), None).unwrap();
+        assert!(!loaded.spotify.lyrics);
     }
 
     #[test]

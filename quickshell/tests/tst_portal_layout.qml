@@ -22,6 +22,7 @@ TestCase {
         property var desktopApps: []
         property var dashboards: ["agents"]
         property var spotify: ({"available": false})
+        property var lyrics: ({"status": "off", "title": "", "artist": "", "lines": []})
         property var basecamp: ({"available": false})
         property var slack: ({"available": false})
         property var github: ({"available": false})
@@ -190,6 +191,7 @@ TestCase {
         portal.pendingGameRequest = ""
         mockStore.dashboards = ["agents"]
         mockStore.spotify = {"available": false}
+        mockStore.lyrics = {"status": "off", "title": "", "artist": "", "lines": []}
         mockPreferences.dashboard = "agents"
         mockStore.desktopApps = [
             {"id": "spotify", "label": "Spotify", "accent": "green"},
@@ -452,6 +454,96 @@ TestCase {
         mockStore.spotify = Object.assign({}, playing, {"position_ms": 5000})
         wait(0)
         verify(view.positionMs < 6000)
+    }
+
+    function test_spotifyLyricsFollowThePlayingLine() {
+        mockStore.dashboards = ["agents", "spotify"]
+        mockPreferences.dashboard = "spotify"
+        mockStore.spotify = {
+            "available": true, "status": "paused", "title": "Track",
+            "artist": "Artist", "album": "", "art_url": "",
+            "length_ms": 200000, "position_ms": 26000,
+            "can_control": true, "can_go_next": true, "can_go_previous": true
+        }
+        wait(0)
+        var view = findChild(portal, "spotifyDashboard")
+        var title = findChild(portal, "spotifyTitle")
+        // Lyrics off: no pane, and the track details keep the full width.
+        verify(!view.lyricsShown)
+        var wideTitle = title.width
+
+        var lines = [
+            {"at_ms": 19490, "text": "Do you feel the world is broken?"},
+            {"at_ms": 25860, "text": "Do you feel the shadows deepen?"},
+            {"at_ms": 51060, "text": ""}
+        ]
+        // Lyrics still held for the previous track read as a lookup.
+        mockStore.lyrics = {
+            "status": "synced", "title": "Earlier", "artist": "Artist", "lines": lines
+        }
+        wait(0)
+        verify(view.lyricsShown)
+        verify(title.width < wideTitle)
+        var status = findChild(portal, "spotifyLyricsStatus")
+        verify(!view.lyricsReady)
+        compare(status.text, "LOOKING FOR LYRICS")
+
+        mockStore.lyrics = {
+            "status": "synced", "title": "Track", "artist": "Artist", "lines": lines
+        }
+        wait(0)
+        verify(view.lyricsReady)
+        var list = findChild(portal, "spotifyLyrics")
+        compare(list.count, 3)
+        compare(view.activeLine, 1)
+        compare(list.currentIndex, 1)
+        // An identical republish keeps the same list rather than resetting it.
+        var model = list.model
+        mockStore.lyrics = {
+            "status": "synced", "title": "Track", "artist": "Artist",
+            "lines": lines.slice()
+        }
+        wait(0)
+        verify(list.model === model)
+
+        mockStore.spotify = Object.assign({}, mockStore.spotify, {"position_ms": 60000})
+        wait(0)
+        compare(view.activeLine, 2)
+        mockStore.spotify = Object.assign({}, mockStore.spotify, {"position_ms": 1000})
+        wait(0)
+        compare(view.activeLine, -1)
+        compare(list.currentIndex, 0)
+
+        mockStore.lyrics = {"status": "missing", "title": "Track", "artist": "Artist", "lines": []}
+        wait(0)
+        verify(view.lyricsShown && !view.lyricsReady)
+        compare(status.text, "NO LYRICS FOR THIS TRACK")
+    }
+
+    Component {
+        id: spotifyViewComponent
+
+        SpotifyView {}
+    }
+
+    function test_spotifyViewCreatedWithLyricsShowsThemAtOnce() {
+        var view = createTemporaryObject(spotifyViewComponent, testCase, {
+            "width": 2512, "height": 600,
+            "spotify": {
+                "available": true, "status": "paused", "title": "Track",
+                "artist": "Artist", "album": "", "art_url": "",
+                "length_ms": 200000, "position_ms": 30000,
+                "can_control": true, "can_go_next": true, "can_go_previous": true
+            },
+            "lyrics": {
+                "status": "synced", "title": "Track", "artist": "Artist",
+                "lines": [{"at_ms": 1000, "text": "One"}, {"at_ms": 20000, "text": "Two"}]
+            }
+        })
+        verify(view !== null)
+        verify(view.lyricsReady)
+        compare(view.activeLine, 1)
+        compare(view.positionMs, 30000)
     }
 
     function basecampSnapshot() {

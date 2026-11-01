@@ -266,6 +266,29 @@
         "can_go_previous": { "type": "boolean" }
       }
     },
+    "lyrics": {
+      "type": "object",
+      "required": ["status"],
+      "properties": {
+        "status": {
+          "enum": ["off", "loading", "synced", "plain", "instrumental", "missing", "unavailable"]
+        },
+        "title": { "type": "string", "maxLength": 160 },
+        "artist": { "type": "string", "maxLength": 160 },
+        "lines": {
+          "type": "array",
+          "maxItems": 400,
+          "items": {
+            "type": "object",
+            "required": ["at_ms", "text"],
+            "properties": {
+              "at_ms": { "type": "integer", "minimum": 0 },
+              "text": { "type": "string", "maxLength": 200 }
+            }
+          }
+        }
+      }
+    },
     "desktopApp": {
       "type": "object",
       "required": ["id", "label", "accent"],
@@ -521,6 +544,7 @@
           "items": { "$ref": "#/$defs/dashboard" }
         },
         "spotify": { "$ref": "#/$defs/spotify" },
+        "lyrics": { "$ref": "#/$defs/lyrics" },
         "basecamp": { "$ref": "#/$defs/basecamp" },
         "slack": { "$ref": "#/$defs/slack" },
         "github": { "$ref": "#/$defs/github" },

@@ -4,6 +4,7 @@ pub mod desktop;
 pub mod github;
 pub mod health;
 pub mod herdr;
+pub mod lyrics;
 pub mod micro;
 pub mod model;
 pub mod protocol;

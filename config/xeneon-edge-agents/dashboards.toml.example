@@ -5,7 +5,8 @@
 # file. Without it only the agent command center is shown.
 #
 #   agents    Herdr / T3 Code agent command center
-#   spotify   Now playing in the Spotify desktop client, with controls
+#   spotify   Now playing in the Spotify desktop client, with controls and
+#             time-synced lyrics from LRCLIB (lrclib.net)
 #   basecamp  Basecamp card tables as lanes plus the Hey! inbox, read through
 #             the signed-in Basecamp CLI (`basecamp login`)
 #   slack     Recent messages in chosen channels plus your unread DMs and
@@ -17,6 +18,11 @@
 #             QtWebEngine, so it runs in Qt's qml runtime (needs qt6-webengine)
 
 dashboards = ["agents", "basecamp", "spotify"]
+
+# Spotify: lyrics are looked up on LRCLIB, which then learns the title,
+# artist, album, and length of each track played. Turn them off with:
+# [spotify]
+# lyrics = false
 
 [basecamp]
 # Optional named Basecamp CLI profile (`basecamp profile list`) the dashboard

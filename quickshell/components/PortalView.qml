@@ -1205,6 +1205,7 @@ Item {
         }
         visible: root.currentDashboard === "spotify"
         spotify: root.store.spotify
+        lyrics: root.store.lyrics
         theme: root.theme
         reducedMotion: root.effectiveReducedMotion
         canOpenSpotify: root.desktopAppConfigured("spotify")

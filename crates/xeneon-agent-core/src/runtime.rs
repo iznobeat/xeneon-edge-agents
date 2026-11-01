@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     env, fs,
     os::unix::fs::{FileTypeExt, PermissionsExt},
     path::{Path, PathBuf},
@@ -26,12 +26,13 @@ use crate::{
     github::{GithubClient, is_github_url},
     health::HealthCollector,
     herdr::{HerdrClient, HerdrTarget, SessionDescriptor},
+    lyrics::{LyricsClient, LyricsQuery},
     micro::MicroCollector,
     model::{
         ActionKind, ActionResult, AgentActions, AgentBackend, AgentBackendSnapshot, AgentOrderMode,
         AgentOrderSnapshot, AgentStatus, ConnectionState, DashboardKind, DesktopAppView,
-        PortalCommand, PortalSnapshot, SCHEMA_VERSION, ServerMessage, SessionState, SessionView,
-        VoiceState, sort_agents,
+        LyricsSnapshot, LyricsStatus, PortalCommand, PortalSnapshot, SCHEMA_VERSION, ServerMessage,
+        SessionState, SessionView, VoiceState, sort_agents,
     },
     protocol::{command_capability_matches, validate_command},
     slack::{SlackClient, is_slack_link},
@@ -47,6 +48,11 @@ const SPOTIFY_POSITION_TOLERANCE_MS: u64 = 1_500;
 const BASECAMP_REFRESH: Duration = Duration::from_secs(60);
 const SLACK_REFRESH: Duration = Duration::from_secs(30);
 const GITHUB_REFRESH: Duration = Duration::from_secs(120);
+// How soon a track change starts a lyrics lookup, and how long a failed one
+// waits before it is tried again.
+const LYRICS_POLL: Duration = Duration::from_millis(500);
+const LYRICS_RETRY: Duration = Duration::from_secs(60);
+const LYRICS_CACHE_TRACKS: usize = 32;
 const BACKEND_STATE_FILE_NAME: &str = "xeneon-edge-agents/agent-backend.toml";
 /// Invalidation key used when the portal switches agent managers.
 const BACKEND_SWITCH_INVALIDATION: &str = "\0backend";
@@ -183,6 +189,7 @@ pub struct DaemonRuntime {
     state: Arc<RwLock<RuntimeState>>,
     desktop: Arc<DesktopController>,
     spotify: SpotifyClient,
+    lyrics: LyricsClient,
     basecamp: BasecampClient,
     slack: SlackClient,
     github: GithubClient,
@@ -264,6 +271,7 @@ impl DaemonRuntime {
                 })),
                 desktop: Arc::new(desktop),
                 spotify: SpotifyClient::default(),
+                lyrics: LyricsClient::default(),
                 basecamp,
                 slack,
                 github,
@@ -417,7 +425,96 @@ impl DaemonRuntime {
                 state.snapshot.github = sample.snapshot;
                 changed
             }),
+            self.lyrics_loop(),
         );
+    }
+
+    /// Looks up lyrics whenever Spotify moves to another track. Lookups run
+    /// here rather than in the Spotify refresh so a slow LRCLIB never stalls
+    /// the now-playing state; recent tracks are kept so skipping back is
+    /// instant, and a failed lookup is retried after `LYRICS_RETRY`.
+    async fn lyrics_loop(&self) {
+        if !self.config.dashboards.contains(&DashboardKind::Spotify) || !self.config.spotify.lyrics
+        {
+            return std::future::pending().await;
+        }
+        let mut cache: VecDeque<(LyricsQuery, LyricsSnapshot)> = VecDeque::new();
+        let mut shown: Option<LyricsQuery> = None;
+        let mut failed_at: Option<Instant> = None;
+        let mut tick = interval(LYRICS_POLL);
+        tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            let query = LyricsQuery::for_track(&self.state.read().await.snapshot.spotify);
+            let retry_due = failed_at.is_some_and(|at| at.elapsed() >= LYRICS_RETRY);
+            if query == shown && !retry_due {
+                continue;
+            }
+            shown = query.clone();
+            failed_at = None;
+            let Some(query) = query else {
+                self.set_lyrics(None, LyricsSnapshot::default()).await;
+                continue;
+            };
+            if let Some((_, cached)) = cache.iter().find(|(key, _)| *key == query) {
+                self.set_lyrics(None, cached.clone()).await;
+                continue;
+            }
+            self.set_lyrics(None, query.snapshot(LyricsStatus::Loading, Vec::new()))
+                .await;
+            // A lookup can take a while when LRCLIB is busy; it is dropped
+            // (and curl with it) as soon as Spotify moves to another track.
+            let lookup = self.lyrics.lookup(&query);
+            tokio::pin!(lookup);
+            let outcome = loop {
+                tokio::select! {
+                    outcome = &mut lookup => break Some(outcome),
+                    _ = tick.tick() => {
+                        let current =
+                            LyricsQuery::for_track(&self.state.read().await.snapshot.spotify);
+                        if current.as_ref() != Some(&query) {
+                            break None;
+                        }
+                    }
+                }
+            };
+            let Some(outcome) = outcome else {
+                continue;
+            };
+            let lyrics = match outcome {
+                Ok(lyrics) => {
+                    if cache.len() == LYRICS_CACHE_TRACKS {
+                        cache.pop_front();
+                    }
+                    cache.push_back((query.clone(), lyrics.clone()));
+                    lyrics
+                }
+                Err(error) => {
+                    tracing::debug!(%error, "lyrics lookup failed");
+                    failed_at = Some(Instant::now());
+                    query.snapshot(LyricsStatus::Unavailable, Vec::new())
+                }
+            };
+            self.set_lyrics(Some(&query), lyrics).await;
+        }
+    }
+
+    /// Publishes `lyrics` unless they changed nothing, or (with `expected`)
+    /// Spotify has since moved on from the track they were looked up for.
+    async fn set_lyrics(&self, expected: Option<&LyricsQuery>, lyrics: LyricsSnapshot) {
+        let mut state = self.state.write().await;
+        if let Some(expected) = expected
+            && LyricsQuery::for_track(&state.snapshot.spotify).as_ref() != Some(expected)
+        {
+            return;
+        }
+        if state.snapshot.lyrics == lyrics {
+            return;
+        }
+        state.snapshot.lyrics = lyrics;
+        state.snapshot.generated_at_ms = now_ms();
+        drop(state);
+        self.publish().await;
     }
 
     /// Runs `refresh` every `period` while `dashboard` is enabled and

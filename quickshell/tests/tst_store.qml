@@ -137,6 +137,26 @@ TestCase {
         compare(reactions[0].count, 3)
     }
 
+    function test_lyricsAreBoundedAndOnlySyncedLinesKeepTimes() {
+        compare(store.normalizeLyrics(null).status, "off")
+        compare(store.normalizeLyrics({"status": "karaoke"}).status, "off")
+        var longText = new Array(300).join("x")
+        var synced = store.normalizeLyrics({
+            "status": "synced", "title": "Track", "artist": "Artist",
+            "lines": [{"at_ms": 1500, "text": longText}, null, {"at_ms": -4, "text": 7}]
+        })
+        compare(synced.lines.length, 2)
+        compare(synced.lines[0].at_ms, 1500)
+        compare(synced.lines[0].text.length, 200)
+        compare(synced.lines[1].at_ms, 0)
+        compare(synced.lines[1].text, "7")
+        var plain = store.normalizeLyrics({
+            "status": "plain", "lines": [{"at_ms": 9000, "text": "Verse"}]
+        })
+        compare(plain.lines[0].at_ms, 0)
+        compare(plain.title, "")
+    }
+
     function test_acceptsFullSnapshotAndSortsAttention() {
         var accepted = store.ingestEnvelope(snapshot(
             10,
