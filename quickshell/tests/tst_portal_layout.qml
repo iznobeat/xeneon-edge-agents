@@ -506,11 +506,18 @@ TestCase {
         wait(0)
         verify(list.model === model)
 
-        // The sung line fills from its start toward the next line's start.
-        mockStore.spotify = Object.assign({}, mockStore.spotify, {"position_ms": 38460})
+        // The sung line fills for about as long as its length suggests
+        // (800 ms + 230 ms a character), not through the pause after it.
+        mockStore.spotify = Object.assign({}, mockStore.spotify, {"position_ms": 29825})
         wait(0)
         compare(list.currentIndex, 1)
         fuzzyCompare(list.currentItem.lineProgress, 0.5, 0.01)
+        // Whole words light up: "Do you feel the" has started by then.
+        compare(list.currentItem.filledChars, "Do you feel the".length)
+        mockStore.spotify = Object.assign({}, mockStore.spotify, {"position_ms": 34000})
+        wait(0)
+        compare(list.currentItem.lineProgress, 1)
+        compare(list.currentItem.filledChars, "Do you feel the shadows deepen?".length)
 
         mockStore.spotify = Object.assign({}, mockStore.spotify, {"position_ms": 60000})
         wait(0)
@@ -550,8 +557,8 @@ TestCase {
         })
         var list = findChild(view, "spotifyLyrics")
         tryVerify(function() { return list.currentItem !== null })
-        // A quarter of the way through: the first row is part filled and
-        // the second not started.
+        // Early in the line the first row is part filled and the second has
+        // not started.
         var fills = []
         tryVerify(function() {
             fills = findChildrenNamed(list.currentItem, "spotifyLyricFill")

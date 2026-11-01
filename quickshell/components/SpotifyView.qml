@@ -635,29 +635,57 @@ Item {
                 )
                 // How far the song is through this line, up to where the
                 // next one starts; drives the karaoke fill.
+                // LRCLIB times lines, not words, so how far the singing is
+                // through the line is an estimate: the line is sung from its
+                // start to a little before the next line, or for at most as
+                // long as its length suggests when a pause follows. A break
+                // lasts until the next line.
                 readonly property real lineProgress: {
                     if (!current)
                         return 0
                     var start = Number(modelData.at_ms)
                     var lines = root.lyricLines
-                    var end = index + 1 < lines.length
+                    var next = index + 1 < lines.length
                         ? Number(lines[index + 1].at_ms)
                         : root.lengthMs
+                    var gapMs = Math.max(1, next - start)
+                    var sungMs = gap
+                        ? gapMs
+                        : Math.min(gapMs * 0.88, 800 + label.text.length * 230)
                     return Math.max(0, Math.min(
                         1,
-                        (root.positionMs - start) / Math.max(1, end - start)
+                        (root.positionMs - start) / Math.max(1, sungMs)
                     ))
                 }
-                // Follows lineProgress smoothly between the view's
-                // quarter-second position updates.
-                property real fill: lineProgress
-
-                Behavior on fill {
-                    enabled: lyricRow.current && root.animated
-                    NumberAnimation {
-                        duration: 250
-                        easing.type: Easing.Linear
+                // Where each word ends in the text, and the share of the
+                // line's time sung before it starts; longer words take longer.
+                readonly property var words: {
+                    var found = []
+                    var pattern = /\S+/g
+                    var match
+                    var total = 0
+                    while ((match = pattern.exec(label.text)) !== null) {
+                        found.push({
+                            "end": match.index + match[0].length,
+                            "before": total
+                        })
+                        total += 2 + match[0].length
                     }
+                    for (var index = 0; index < found.length; index += 1)
+                        found[index].before /= Math.max(1, total)
+                    return found
+                }
+                // Characters up to the end of the last word that has started.
+                readonly property int filledChars: {
+                    if (!current)
+                        return 0
+                    var filled = 0
+                    for (var index = 0; index < words.length; index += 1) {
+                        if (words[index].before > lineProgress)
+                            break
+                        filled = words[index].end
+                    }
+                    return filled
                 }
 
                 width: ListView.view.width
@@ -696,9 +724,37 @@ Item {
                         // of them at once.
                         property var rows: []
                         property var laidOut: []
-                        readonly property real rowsWidth: rows.reduce(
-                            function(total, row) { return total + row.width }, 0
-                        )
+                        // The characters on each row, found by measuring how
+                        // much of the text fits the row's laid-out width.
+                        readonly property var rowRanges: {
+                            var ranges = []
+                            var position = 0
+                            for (var row = 0; row < rows.length; row += 1) {
+                                while (position < text.length && text[position] === " ")
+                                    position += 1
+                                var start = position
+                                var count = 0
+                                if (row === rows.length - 1) {
+                                    count = text.length - start
+                                } else {
+                                    while (start + count < text.length
+                                            && metrics.advanceWidth(
+                                                text.substring(start, start + count + 1)
+                                                    .replace(/\s+$/, "")
+                                            ) <= rows[row].width + 1)
+                                        count += 1
+                                }
+                                ranges.push({"start": start, "count": count})
+                                position = start + count
+                            }
+                            return ranges
+                        }
+
+                        FontMetrics {
+                            id: metrics
+
+                            font: label.font
+                        }
 
                         onLineLaidOut: (line) => {
                             if (line.number === 0)
@@ -741,18 +797,32 @@ Item {
 
                             required property var modelData
                             required property int index
-                            readonly property real before: label.rows
-                                .slice(0, index)
-                                .reduce(function(total, row) { return total + row.width }, 0)
+                            readonly property var range: label.rowRanges[index]
+                                || {"start": 0, "count": 0}
+                            readonly property int filled: Math.max(0, Math.min(
+                                range.count,
+                                lyricRow.filledChars - range.start
+                            ))
 
                             objectName: "spotifyLyricFill"
                             y: modelData.y
-                            width: Math.max(0, Math.min(
-                                modelData.width,
-                                lyricRow.fill * label.rowsWidth - before
-                            ))
+                            width: filled <= 0
+                                ? 0
+                                : metrics.advanceWidth(label.text.substring(
+                                    range.start,
+                                    range.start + filled
+                                ).replace(/\s+$/, ""))
                             height: modelData.height
                             clip: true
+
+                            // Each word lights up with a quick sweep.
+                            Behavior on width {
+                                enabled: root.animated && lyricRow.current
+                                NumberAnimation {
+                                    duration: 160
+                                    easing.type: Easing.OutCubic
+                                }
+                            }
 
                             Text {
                                 y: -fillRow.y
