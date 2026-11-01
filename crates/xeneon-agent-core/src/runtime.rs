@@ -51,7 +51,7 @@ const GITHUB_REFRESH: Duration = Duration::from_secs(120);
 // How soon a track change starts a lyrics lookup, and how long a failed one
 // waits before it is tried again.
 const LYRICS_POLL: Duration = Duration::from_millis(500);
-const LYRICS_RETRY: Duration = Duration::from_secs(60);
+const LYRICS_RETRY: Duration = Duration::from_secs(20);
 const LYRICS_CACHE_TRACKS: usize = 32;
 const BACKEND_STATE_FILE_NAME: &str = "xeneon-edge-agents/agent-backend.toml";
 /// Invalidation key used when the portal switches agent managers.

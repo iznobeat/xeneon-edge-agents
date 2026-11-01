@@ -82,30 +82,28 @@ impl LyricsClient {
     /// `Missing`. An error means LRCLIB could not be asked (busy, offline)
     /// and the lookup is worth repeating later.
     pub async fn lookup(&self, query: &LyricsQuery) -> Result<LyricsSnapshot> {
-        // `get-cached` answers from LRCLIB's own records without the external
-        // lookups that make `get` slow and often busy. It needs an artist.
+        // `get-cached` answers quickly from the tracks LRCLIB already holds
+        // and is rarely busy; `get` also finds the rest but is often busy
+        // under load. Both need an artist.
         let mut exact_failed = None;
         if !query.artist.is_empty() {
             let duration = query.duration_s.to_string();
-            let exact = self
-                .get(
-                    "get-cached",
-                    &[
-                        ("track_name", &query.title),
-                        ("artist_name", &query.artist),
-                        ("album_name", &query.album),
-                        ("duration", &duration),
-                    ],
-                )
-                .await;
-            match exact {
-                Ok(Some(record)) => {
-                    if let Some(snapshot) = from_record(query, &record) {
-                        return Ok(snapshot);
+            let params = [
+                ("track_name", query.title.as_str()),
+                ("artist_name", query.artist.as_str()),
+                ("album_name", query.album.as_str()),
+                ("duration", duration.as_str()),
+            ];
+            for endpoint in ["get-cached", "get"] {
+                match self.get(endpoint, &params).await {
+                    Ok(Some(record)) => {
+                        if let Some(snapshot) = from_record(query, &record) {
+                            return Ok(snapshot);
+                        }
                     }
+                    Ok(None) => {}
+                    Err(error) => exact_failed = Some(error),
                 }
-                Ok(None) => {}
-                Err(error) => exact_failed = Some(error),
             }
         }
         // Spotify titles often carry a suffix ("- Remastered 2011", "(Live)")
@@ -448,7 +446,7 @@ mod tests {
 config=$(cat)
 printf '%s\n' "$config" >> '{dir}/requests'
 case "$config" in
-  *"/api/get-cached?"*) name=get ;;
+  *"/api/get-cached?"*|*"/api/get?"*) name=get ;;
   *) name=search ;;
 esac
 cat '{dir}/'$name.body
@@ -527,7 +525,7 @@ printf '\n%s' "$(cat '{dir}/'$name.status)"
         };
         client.lookup(&untagged).await.unwrap();
         let requests = fs::read_to_string(temp.path().join("requests")).unwrap();
-        assert!(!requests.contains("get-cached"));
+        assert!(!requests.contains("/api/get"));
         assert_eq!(requests.matches("/api/search?").count(), 1);
     }
 
@@ -542,6 +540,7 @@ printf '\n%s' "$(cat '{dir}/'$name.status)"
             requests.matches("/api/get-cached?").count(),
             ATTEMPTS as usize
         );
+        assert_eq!(requests.matches("/api/get?").count(), ATTEMPTS as usize);
         // A busy exact lookup still lets the search answer.
         fs::write(temp.path().join("search.status"), "200").unwrap();
         fs::write(
