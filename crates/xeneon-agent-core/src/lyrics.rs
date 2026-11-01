@@ -83,42 +83,65 @@ impl LyricsClient {
     /// and the lookup is worth repeating later.
     pub async fn lookup(&self, query: &LyricsQuery) -> Result<LyricsSnapshot> {
         // `get-cached` answers quickly from the tracks LRCLIB already holds
-        // and is rarely busy; `get` also finds the rest but is often busy
-        // under load. Both need an artist.
-        let mut exact_failed = None;
-        if !query.artist.is_empty() {
-            let duration = query.duration_s.to_string();
-            let params = [
-                ("track_name", query.title.as_str()),
-                ("artist_name", query.artist.as_str()),
-                ("album_name", query.album.as_str()),
-                ("duration", duration.as_str()),
-            ];
-            for endpoint in ["get-cached", "get"] {
-                match self.get(endpoint, &params).await {
-                    Ok(Some(record)) => {
-                        if let Some(snapshot) = from_record(query, &record) {
-                            return Ok(snapshot);
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(error) => exact_failed = Some(error),
-                }
+        // and the search is rarely busy either. `get` also asks LRCLIB's
+        // external sources, so it is slow and often busy under load: it is
+        // tried last, and only while no synced lyrics have turned up. The
+        // exact lookups need an artist.
+        let duration = query.duration_s.to_string();
+        let params = [
+            ("track_name", query.title.as_str()),
+            ("artist_name", query.artist.as_str()),
+            ("album_name", query.album.as_str()),
+            ("duration", duration.as_str()),
+        ];
+        let exact = !query.artist.is_empty();
+        let mut best = None;
+        let mut failed = None;
+        if exact {
+            match self.get("get-cached", &params, ATTEMPTS).await {
+                Ok(record) => best = record.and_then(|record| from_record(query, &record)),
+                Err(error) => failed = Some(error),
             }
         }
-        // Spotify titles often carry a suffix ("- Remastered 2011", "(Live)")
-        // and several artists that LRCLIB files differently, so fall back to
-        // a search on the bare title and first artist, matched by length.
+        if !is_final(&best) {
+            match self.search(query).await {
+                Ok(found) => best = better(best, found),
+                Err(error) => failed = Some(error),
+            }
+        }
+        if exact && !is_final(&best) {
+            // With plain lyrics in hand, a busy `get` is asked only once.
+            let attempts = if best.is_some() { 1 } else { ATTEMPTS };
+            match self.get("get", &params, attempts).await {
+                Ok(record) => {
+                    best = better(best, record.and_then(|record| from_record(query, &record)))
+                }
+                Err(error) => failed = Some(error),
+            }
+        }
+        match (best, failed) {
+            (Some(best), _) => Ok(best),
+            // A lookup that could not be asked might still have had them.
+            (None, Some(error)) => Err(error),
+            (None, None) => Ok(query.snapshot(LyricsStatus::Missing, Vec::new())),
+        }
+    }
+
+    /// The best search match. Spotify titles often carry a suffix ("-
+    /// Remastered 2011", "(Live)") and several artists that LRCLIB files
+    /// differently, so it searches the bare title and first artist and
+    /// matches by length.
+    async fn search(&self, query: &LyricsQuery) -> Result<Option<LyricsSnapshot>> {
         let title = bare_title(&query.title);
         let artist = query.artist.split(", ").next().unwrap_or_default();
-        let found = match self
-            .get("search", &[("track_name", title), ("artist_name", artist)])
-            .await
-        {
-            Ok(found) => found,
-            Err(error) => return Err(exact_failed.unwrap_or(error)),
-        };
-        let best = found
+        let found = self
+            .get(
+                "search",
+                &[("track_name", title), ("artist_name", artist)],
+                ATTEMPTS,
+            )
+            .await?;
+        Ok(found
             .as_ref()
             .and_then(Value::as_array)
             .into_iter()
@@ -129,23 +152,18 @@ impl LyricsClient {
                 })
             })
             .filter_map(|record| from_record(query, record))
-            .min_by_key(|snapshot| match snapshot.status {
-                LyricsStatus::Synced => 0,
-                LyricsStatus::Plain => 1,
-                _ => 2,
-            });
-        match (best, exact_failed) {
-            (Some(best), _) => Ok(best),
-            // The exact lookup might still have had them.
-            (None, Some(error)) => Err(error),
-            (None, None) => Ok(query.snapshot(LyricsStatus::Missing, Vec::new())),
-        }
+            .min_by_key(rank))
     }
 
     /// One LRCLIB request; `None` when it has no answer for these parameters
     /// (404, another 4xx, or a body that is not JSON), which asking again
     /// would not change. Only a busy or unreachable LRCLIB is an error.
-    async fn get(&self, endpoint: &str, params: &[(&str, &str)]) -> Result<Option<Value>> {
+    async fn get(
+        &self,
+        endpoint: &str,
+        params: &[(&str, &str)],
+        attempts: u32,
+    ) -> Result<Option<Value>> {
         let query = params
             .iter()
             .map(|(key, value)| format!("{key}={}", percent_encode(value)))
@@ -164,7 +182,7 @@ impl LyricsClient {
                         .ok());
                 }
                 (status, _) if status != 429 && (400..500).contains(&status) => return Ok(None),
-                (status, _) if attempt < ATTEMPTS => {
+                (status, _) if attempt < attempts => {
                     tracing::debug!(status, endpoint, "LRCLIB busy, retrying");
                     attempt += 1;
                     tokio::time::sleep(RETRY_DELAY).await;
@@ -218,6 +236,32 @@ impl LyricsClient {
         body.truncate(split);
         Ok((status, body))
     }
+}
+
+/// Synced lyrics come first, then an instrumental, then plain lyrics.
+fn rank(snapshot: &LyricsSnapshot) -> u8 {
+    match snapshot.status {
+        LyricsStatus::Synced => 0,
+        LyricsStatus::Instrumental => 1,
+        LyricsStatus::Plain => 2,
+        _ => 3,
+    }
+}
+
+fn better(
+    current: Option<LyricsSnapshot>,
+    found: Option<LyricsSnapshot>,
+) -> Option<LyricsSnapshot> {
+    match (current, found) {
+        (Some(current), Some(found)) if rank(&found) < rank(&current) => Some(found),
+        (Some(current), _) => Some(current),
+        (None, found) => found,
+    }
+}
+
+/// Nothing better than these is left to look for.
+fn is_final(best: &Option<LyricsSnapshot>) -> bool {
+    best.as_ref().is_some_and(|snapshot| rank(snapshot) <= 1)
 }
 
 /// The lyrics in one LRCLIB record, preferring its synced lines; `None`
@@ -446,7 +490,8 @@ mod tests {
 config=$(cat)
 printf '%s\n' "$config" >> '{dir}/requests'
 case "$config" in
-  *"/api/get-cached?"*|*"/api/get?"*) name=get ;;
+  *"/api/get-cached?"*) name=get; [ -f '{dir}/cached.body' ] && name=cached ;;
+  *"/api/get?"*) name=get ;;
   *) name=search ;;
 esac
 cat '{dir}/'$name.body
@@ -510,6 +555,36 @@ printf '\n%s' "$(cat '{dir}/'$name.status)"
     }
 
     #[tokio::test]
+    async fn the_slow_get_is_asked_only_while_synced_lyrics_are_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let curl = fake_curl(
+            temp.path(),
+            (200, r#"{"syncedLyrics":"[00:05.00]From get"}"#),
+            (
+                200,
+                r#"[{"duration":294,"syncedLyrics":"[00:02.00]From search"}]"#,
+            ),
+        );
+        fs::write(temp.path().join("cached.status"), "404").unwrap();
+        fs::write(temp.path().join("cached.body"), "{}").unwrap();
+        let client = LyricsClient::new(curl, "https://lrclib.net/api/");
+        let lyrics = client.lookup(&query()).await.unwrap();
+        assert_eq!(lyrics.lines[0].text, "From search");
+        let requests = fs::read_to_string(temp.path().join("requests")).unwrap();
+        assert!(!requests.contains("/api/get?"));
+
+        // Plain lyrics from the search are upgraded by a synced `get`.
+        fs::write(
+            temp.path().join("search.body"),
+            r#"[{"duration":294,"plainLyrics":"Plain"}]"#,
+        )
+        .unwrap();
+        let lyrics = client.lookup(&query()).await.unwrap();
+        assert_eq!(lyrics.status, LyricsStatus::Synced);
+        assert_eq!(lyrics.lines[0].text, "From get");
+    }
+
+    #[tokio::test]
     async fn answers_that_asking_again_would_not_change_are_missing_lyrics() {
         let temp = tempfile::tempdir().unwrap();
         let curl = fake_curl(temp.path(), (400, "bad"), (200, "not json"));
@@ -541,7 +616,9 @@ printf '\n%s' "$(cat '{dir}/'$name.status)"
             ATTEMPTS as usize
         );
         assert_eq!(requests.matches("/api/get?").count(), ATTEMPTS as usize);
-        // A busy exact lookup still lets the search answer.
+        // A busy exact lookup still lets the search answer, and with plain
+        // lyrics in hand the busy `get` is asked only once more.
+        fs::remove_file(temp.path().join("requests")).unwrap();
         fs::write(temp.path().join("search.status"), "200").unwrap();
         fs::write(
             temp.path().join("search.body"),
@@ -552,6 +629,8 @@ printf '\n%s' "$(cat '{dir}/'$name.status)"
             client.lookup(&query()).await.unwrap().status,
             LyricsStatus::Plain
         );
+        let requests = fs::read_to_string(temp.path().join("requests")).unwrap();
+        assert_eq!(requests.matches("/api/get?").count(), 1);
         let missing = LyricsClient::new("/nonexistent/curl", "https://lrclib.net/api/");
         assert!(missing.lookup(&query()).await.is_err());
     }

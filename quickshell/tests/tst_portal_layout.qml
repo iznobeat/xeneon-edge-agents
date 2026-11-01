@@ -571,6 +571,35 @@ TestCase {
         verify(fills[0].width > 0)
     }
 
+    function test_untimedLyricsScrollWithTheSong() {
+        var lines = []
+        for (var index = 0; index < 60; index += 1)
+            lines.push({"at_ms": 0, "text": "Line " + index})
+        var view = createTemporaryObject(spotifyViewComponent, testCase, {
+            "width": 2512, "height": 600, "reducedMotion": true,
+            "spotify": {
+                "available": true, "status": "paused", "title": "Track",
+                "artist": "Artist", "album": "", "art_url": "",
+                "length_ms": 200000, "position_ms": 100000,
+                "can_control": true, "can_go_next": true, "can_go_previous": true
+            },
+            "lyrics": {"status": "plain", "title": "Track", "artist": "Artist", "lines": lines}
+        })
+        var list = findChild(view, "spotifyLyrics")
+        // Halfway through the song, halfway down the lyrics. (The view is
+        // not on screen here, so its once-a-second follow is called directly.)
+        list.followSong()
+        var range = list.contentHeight - list.height
+        verify(range > 0)
+        verify(Math.abs(list.contentY - list.originY - range / 2) < 40)
+        // After a touch the reader keeps their place for a while.
+        list.touchedAtMs = Date.now()
+        var kept = list.contentY
+        view.sampledPositionMs = 10000
+        list.followSong()
+        compare(list.contentY, kept)
+    }
+
     function findChildrenNamed(item, name) {
         var found = []
         function walk(node) {

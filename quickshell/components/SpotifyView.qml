@@ -555,7 +555,7 @@ Item {
             height: 28
             verticalAlignment: Text.AlignVCenter
             text: root.lyricsState === "plain"
-                ? "LYRICS  //  NOT TIME-SYNCED"
+                ? "LYRICS  //  NO TIMING FOR THIS SONG"
                 : "LYRICS"
             textFormat: Text.PlainText
             color: root.readableMuted
@@ -596,8 +596,48 @@ Item {
                 + (currentItem ? currentItem.height : 40)
             highlightFollowsCurrentItem: true
             highlightMoveDuration: root.reducedMotion ? 0 : 520
-            onMovementStarted: root.interacted()
+            onMovementStarted: {
+                touchedAtMs = Date.now()
+                root.interacted()
+            }
             transform: Translate { id: lyricShift }
+
+            // Untimed lyrics scroll with the song's progress, so they roughly
+            // keep up with it, except for a while after a touch.
+            property double touchedAtMs: 0
+
+            function followSong() {
+                if (moving || Date.now() - touchedAtMs < 8000)
+                    return
+                var range = contentHeight - height
+                if (range <= 0)
+                    return
+                var target = originY + range * root.progress
+                if (!root.animated) {
+                    contentY = target
+                    return
+                }
+                plainScroll.to = target
+                plainScroll.restart()
+            }
+
+            Timer {
+                interval: 1000
+                repeat: true
+                triggeredOnStart: true
+                running: root.lyricsState === "plain" && root.lyricsReady
+                    && root.visible
+                onTriggered: lyricList.followSong()
+            }
+
+            NumberAnimation {
+                id: plainScroll
+
+                target: lyricList
+                property: "contentY"
+                duration: 950
+                easing.type: Easing.InOutSine
+            }
 
             // New lyrics fade and slide up into place.
             ParallelAnimation {
