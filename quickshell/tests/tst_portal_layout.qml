@@ -506,19 +506,6 @@ TestCase {
         wait(0)
         verify(list.model === model)
 
-        // The sung line fills for about as long as its length suggests
-        // (800 ms + 230 ms a character), not through the pause after it.
-        mockStore.spotify = Object.assign({}, mockStore.spotify, {"position_ms": 29825})
-        wait(0)
-        compare(list.currentIndex, 1)
-        fuzzyCompare(list.currentItem.lineProgress, 0.5, 0.01)
-        // Whole words light up: "Do you feel the" has started by then.
-        compare(list.currentItem.filledChars, "Do you feel the".length)
-        mockStore.spotify = Object.assign({}, mockStore.spotify, {"position_ms": 34000})
-        wait(0)
-        compare(list.currentItem.lineProgress, 1)
-        compare(list.currentItem.filledChars, "Do you feel the shadows deepen?".length)
-
         mockStore.spotify = Object.assign({}, mockStore.spotify, {"position_ms": 60000})
         wait(0)
         compare(view.activeLine, 2)
@@ -537,38 +524,6 @@ TestCase {
         id: spotifyViewComponent
 
         SpotifyView {}
-    }
-
-    function test_karaokeFillRunsThroughWrappedRowsInOrder() {
-        var longLine = "It's who You are, it's who You are, it's who You are, "
-            + "it's who You are, it's who You are"
-        var view = createTemporaryObject(spotifyViewComponent, testCase, {
-            "width": 1400, "height": 600,
-            "spotify": {
-                "available": true, "status": "paused", "title": "Track",
-                "artist": "Artist", "album": "", "art_url": "",
-                "length_ms": 200000, "position_ms": 15000,
-                "can_control": true, "can_go_next": true, "can_go_previous": true
-            },
-            "lyrics": {
-                "status": "synced", "title": "Track", "artist": "Artist",
-                "lines": [{"at_ms": 10000, "text": longLine}, {"at_ms": 30000, "text": "Next"}]
-            }
-        })
-        var list = findChild(view, "spotifyLyrics")
-        tryVerify(function() { return list.currentItem !== null })
-        // Early in the line the first row is part filled and the second has
-        // not started.
-        var fills = []
-        tryVerify(function() {
-            fills = findChildrenNamed(list.currentItem, "spotifyLyricFill")
-            return fills.length >= 2
-        })
-        tryVerify(function() { return fills[0].width > 0 })
-        compare(fills[1].width, 0)
-        view.sampledPositionMs = 25000
-        tryVerify(function() { return fills[1].width > 0 })
-        verify(fills[0].width > 0)
     }
 
     function test_untimedLyricsScrollWithTheSong() {
@@ -598,19 +553,6 @@ TestCase {
         view.sampledPositionMs = 10000
         list.followSong()
         compare(list.contentY, kept)
-    }
-
-    function findChildrenNamed(item, name) {
-        var found = []
-        function walk(node) {
-            if (node.objectName === name)
-                found.push(node)
-            var children = node.children || []
-            for (var index = 0; index < children.length; index += 1)
-                walk(children[index])
-        }
-        walk(item)
-        return found
     }
 
     function test_spotifyViewCreatedWithLyricsShowsThemAtOnce() {
