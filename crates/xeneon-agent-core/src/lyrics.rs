@@ -11,7 +11,7 @@ const API_BASE: &str = "https://lrclib.net/api/";
 const USER_AGENT: &str = concat!(
     "xeneon-edge-agents/",
     env!("CARGO_PKG_VERSION"),
-    " (https://github.com/jhgundersen/xeneon-edge-agents)"
+    " (https://github.com/iznobeat/xeneon-edge-agents)"
 );
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_RESPONSE_BYTES: &str = "2097152";
