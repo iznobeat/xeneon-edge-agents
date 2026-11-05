@@ -434,8 +434,16 @@ verification, installation, and the live handoff.
 - Portal preferences persist at
   `~/.local/state/xeneon-edge-agents/portal/preferences.ini` with mode `0600`;
   physical validation ended in the default full-motion, normal-screen state.
-- `hyprland.lua` contains the installer-managed XENEON require, and the
-  generated module maps only `wch.cn-touchscreen-1` to `DP-2`.
+- `hyprland.lua` contains the installer-managed XENEON require. The touch
+  controller's touchscreen and mouse nodes share a kernel name, and on
+  2026-11-05 Hyprland listed the touchscreen as `wch.cn-touchscreen` and the
+  mouse as `wch.cn-touchscreen-1`, which blocked the stack. The reconciler now
+  maps the one touch device in that name family to `DP-2`, and the module
+  disables both names. Fixture tests, live `check.sh`, and a running stack pass;
+  physical touch after this change still needs confirming.
+- Portal-opened apps move off the EDGE before focus. Live on 2026-11-05 with the
+  EDGE focused, a `desktop_app` command through `qml-bridge` mapped Spotify on
+  `DP-2` workspace 11 and it moved to `DP-1` workspace 1.
 - The persisted home layout places the 1280x360 logical EDGE at `560,1350`,
   centered below the 2400x1350 logical external display, with the laptop
   immediately to its right at `1840,1350`. The external display is running at

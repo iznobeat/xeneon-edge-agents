@@ -232,7 +232,7 @@ impl DesktopController {
         match select_desktop_candidate(&clients, spec)? {
             Some(client) => {
                 self.launching_since.lock().await.remove(&app);
-                dispatch_focus(&self.hyprctl_bin, &client.address).await?;
+                self.focus_off_edge(client).await?;
                 Ok(DesktopAppOutcome::Focused)
             }
             None => {
@@ -253,6 +253,25 @@ impl DesktopController {
                 self.wait_for_launched_client(app, spec).await
             }
         }
+    }
+
+    /// Focuses an app the portal opened, first sending it to another monitor
+    /// when it sits on the EDGE: the portal's overlay would hide it there. With
+    /// no other monitor it stays put, since the EDGE is then all there is.
+    async fn focus_off_edge(&self, client: &HyprClient) -> Result<()> {
+        if let Some(edge) = self.config.edge_output.as_deref() {
+            let monitors =
+                hypr_json::<Vec<HyprMonitor>>(&self.hyprctl_bin, &["monitors", "-j"]).await?;
+            if let Some(target) = off_edge_target(&monitors, client.monitor, edge) {
+                dispatch(
+                    &self.hyprctl_bin,
+                    &move_to_monitor_expression(&client.address, &target.name)?,
+                )
+                .await
+                .context("moving a desktop app off the EDGE")?;
+            }
+        }
+        dispatch_focus(&self.hyprctl_bin, &client.address).await
     }
 
     async fn wait_for_launched_client(
@@ -280,7 +299,7 @@ impl DesktopController {
             match candidate {
                 Some(client) => {
                     self.launching_since.lock().await.remove(&app);
-                    dispatch_focus(&self.hyprctl_bin, &client.address).await?;
+                    self.focus_off_edge(client).await?;
                     return Ok(DesktopAppOutcome::LaunchedAndFocused);
                 }
                 None if Instant::now() < deadline => sleep(self.launch_poll_interval).await,
@@ -556,6 +575,23 @@ fn desktop_app_spec(config: &DesktopConfig, app: DesktopApp) -> Result<DesktopAp
     }
 }
 
+/// Where a window on the EDGE should go: the focused other monitor, or else the
+/// lowest-numbered one. Nothing when the window is elsewhere or the EDGE is the
+/// only monitor.
+fn off_edge_target<'m>(
+    monitors: &'m [HyprMonitor],
+    client_monitor: i64,
+    edge_output: &str,
+) -> Option<&'m HyprMonitor> {
+    monitors
+        .iter()
+        .find(|monitor| monitor.id == client_monitor && monitor.name == edge_output)?;
+    monitors
+        .iter()
+        .filter(|monitor| monitor.name != edge_output)
+        .min_by_key(|monitor| (!monitor.focused, monitor.id))
+}
+
 fn is_game_client(client: &HyprClient) -> bool {
     (client.class == GAME_WINDOW_CLASS || client.initial_class == GAME_WINDOW_CLASS)
         && client.initial_title == GAME_WINDOW_TITLE
@@ -698,6 +734,20 @@ async fn dispatch(hyprctl_bin: &Path, expression: &str) -> Result<()> {
 fn focus_expression(address: &str) -> Result<String> {
     Ok(format!(
         "hl.dsp.focus({{ window = \"{}\" }})",
+        window_selector(address)?
+    ))
+}
+
+fn move_to_monitor_expression(address: &str, monitor: &str) -> Result<String> {
+    let safe = !monitor.is_empty()
+        && monitor
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'));
+    if !safe {
+        bail!("Hyprland monitor name is not a plain connector name");
+    }
+    Ok(format!(
+        "hl.dsp.window.move({{ monitor = \"{monitor}\", window = \"{}\" }})",
         window_selector(address)?
     ))
 }
@@ -886,7 +936,7 @@ fn interactive_herdr_session(command: &[String]) -> Option<HerdrClientSession<'_
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::PermissionsExt;
+    use std::io::Write;
 
     use super::*;
 
@@ -1315,6 +1365,172 @@ mod tests {
         assert!(focus_expression("0x1\" })").is_err());
     }
 
+    #[test]
+    fn move_expression_uses_installed_lua_dispatcher_syntax() {
+        assert_eq!(
+            move_to_monitor_expression("0x123abc", "DP-1").unwrap(),
+            "hl.dsp.window.move({ monitor = \"DP-1\", window = \"address:0x123abc\" })"
+        );
+        assert!(move_to_monitor_expression("0x123abc", "").is_err());
+        assert!(move_to_monitor_expression("0x123abc", "DP-1\" })").is_err());
+        assert!(move_to_monitor_expression("title:herdr", "DP-1").is_err());
+    }
+
+    fn monitors(entries: &[(i64, &str, bool)]) -> Vec<HyprMonitor> {
+        serde_json::from_value(serde_json::Value::Array(
+            entries
+                .iter()
+                .map(|(id, name, focused)| {
+                    serde_json::json!({"id": id, "name": name, "focused": focused})
+                })
+                .collect(),
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn off_edge_target_prefers_the_focused_other_monitor() {
+        let all = monitors(&[
+            (1, "DP-1", false),
+            (2, "DP-2", false),
+            (3, "HDMI-A-1", true),
+        ]);
+        assert_eq!(off_edge_target(&all, 2, "DP-2").unwrap().name, "HDMI-A-1");
+    }
+
+    #[test]
+    fn off_edge_target_falls_back_to_the_lowest_id_when_the_edge_has_focus() {
+        let all = monitors(&[
+            (3, "HDMI-A-1", false),
+            (2, "DP-2", true),
+            (1, "DP-1", false),
+        ]);
+        assert_eq!(off_edge_target(&all, 2, "DP-2").unwrap().name, "DP-1");
+    }
+
+    #[test]
+    fn off_edge_target_leaves_other_windows_and_a_lone_edge_alone() {
+        let all = monitors(&[(1, "DP-1", true), (2, "DP-2", false)]);
+        assert!(off_edge_target(&all, 1, "DP-2").is_none());
+        let lone = monitors(&[(2, "DP-2", true)]);
+        assert!(off_edge_target(&lone, 2, "DP-2").is_none());
+    }
+
+    /// Runs `focus_or_launch` for Spotify against a fake Hyprland showing it on
+    /// the given monitor, and returns the dispatches in order.
+    async fn dispatches_for_spotify_on(monitor: i64) -> Vec<String> {
+        let temp = tempfile::tempdir().unwrap();
+        let log = temp.path().join("dispatch.log");
+        let hyprctl = temp.path().join("hyprctl");
+        write_executable(
+            &hyprctl,
+            &format!(
+                r#"#!/bin/sh
+if [ "$1" = "clients" ]; then
+  printf '%s\n' '[{{"address":"0xabc","class":"spotify","initialClass":"spotify","title":"Spotify","pid":42,"monitor":{monitor}}}]'
+elif [ "$1" = "monitors" ]; then
+  printf '%s\n' '[{{"id":1,"name":"DP-1","focused":false}},{{"id":2,"name":"DP-2","focused":true}}]'
+elif [ "$1" = "dispatch" ]; then
+  printf '%s\n' "$2" >> "{log}"
+  printf '%s\n' 'ok'
+fi
+"#,
+                log = log.display()
+            ),
+        );
+        let config = DesktopConfig {
+            edge_output: Some("DP-2".into()),
+            ..DesktopConfig::default()
+        };
+        let mut controller = DesktopController::new(config);
+        controller.hyprctl_bin = hyprctl;
+        assert_eq!(
+            controller
+                .focus_or_launch(DesktopApp::Configured(0))
+                .await
+                .unwrap(),
+            DesktopAppOutcome::Focused
+        );
+        fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn app_on_the_edge_moves_to_another_monitor_before_focus() {
+        assert_eq!(
+            dispatches_for_spotify_on(2).await,
+            [
+                "hl.dsp.window.move({ monitor = \"DP-1\", window = \"address:0xabc\" })",
+                "hl.dsp.focus({ window = \"address:0xabc\" })",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn launched_app_that_lands_on_the_edge_moves_before_focus() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("mapped");
+        let log = temp.path().join("dispatch.log");
+        let hyprctl = temp.path().join("hyprctl");
+        let uwsm = temp.path().join("uwsm");
+        write_executable(
+            &hyprctl,
+            &format!(
+                r#"#!/bin/sh
+if [ "$1" = "clients" ]; then
+  if [ -e "{marker}" ]; then
+    printf '%s\n' '[{{"address":"0xabc","class":"spotify","initialClass":"spotify","title":"Spotify","pid":42,"monitor":2}}]'
+  else
+    printf '%s\n' '[]'
+  fi
+elif [ "$1" = "monitors" ]; then
+  printf '%s\n' '[{{"id":1,"name":"DP-1","focused":false}},{{"id":2,"name":"DP-2","focused":true}}]'
+elif [ "$1" = "dispatch" ]; then
+  printf '%s\n' "$2" >> "{log}"
+  printf '%s\n' 'ok'
+fi
+"#,
+                marker = marker.display(),
+                log = log.display()
+            ),
+        );
+        write_executable(&uwsm, &format!("#!/bin/sh\n: > \"{}\"\n", marker.display()));
+        let config = DesktopConfig {
+            edge_output: Some("DP-2".into()),
+            ..DesktopConfig::default()
+        };
+        let mut controller = DesktopController::new(config);
+        controller.hyprctl_bin = hyprctl;
+        controller.uwsm_bin = uwsm;
+        controller.launch_poll_interval = Duration::from_millis(10);
+        controller.launch_observation_timeout = Duration::from_secs(2);
+        assert_eq!(
+            controller
+                .focus_or_launch(DesktopApp::Configured(0))
+                .await
+                .unwrap(),
+            DesktopAppOutcome::LaunchedAndFocused
+        );
+        assert_eq!(
+            fs::read_to_string(log).unwrap().lines().collect::<Vec<_>>(),
+            [
+                "hl.dsp.window.move({ monitor = \"DP-1\", window = \"address:0xabc\" })",
+                "hl.dsp.focus({ window = \"address:0xabc\" })",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn app_off_the_edge_is_only_focused() {
+        assert_eq!(
+            dispatches_for_spotify_on(1).await,
+            ["hl.dsp.focus({ window = \"address:0xabc\" })"]
+        );
+    }
+
     fn edge_layers(portal_height: i64) -> HashMap<String, HyprLayerMonitor> {
         serde_json::from_value(serde_json::json!({
             "DP-2": {"levels": {
@@ -1534,8 +1750,21 @@ printf '%s\n' "$*" >> "{launch_log}"
         assert_eq!(fs::read_to_string(launch_log).unwrap().lines().count(), 2);
     }
 
+    /// Written by a child process: a write fd held here would leak into any
+    /// test forking at that moment, and running the stub then fails ETXTBSY.
     fn write_executable(path: &Path, contents: &str) {
-        fs::write(path, contents).unwrap();
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut writer = std::process::Command::new("sh")
+            .args(["-c", "cat >\"$1\" && chmod 700 \"$1\"", "sh"])
+            .arg(path)
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        writer
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(contents.as_bytes())
+            .unwrap();
+        assert!(writer.wait().unwrap().success());
     }
 }

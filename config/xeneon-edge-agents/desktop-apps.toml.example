@@ -1,6 +1,7 @@
 # Desktop apps the XENEON EDGE command center may focus or launch on this
 # machine. The Spotify dashboard launches the app with id "spotify" when
-# Spotify is not running.
+# Spotify is not running. An app that lands on the EDGE moves to another monitor
+# before it is focused, so the portal never hides it.
 # Copy to ~/.config/xeneon-edge-agents/desktop-apps.toml and restart the
 # daemon (systemctl --user restart xeneon-agentd). The installer never writes
 # this file, so it survives reinstalls.
