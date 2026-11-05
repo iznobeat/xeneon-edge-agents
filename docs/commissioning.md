@@ -63,7 +63,11 @@ device-provided `uniq`. The USB bus
 must be `0003`; vendor and product IDs are captured from the actual touchscreen
 and are not inferred from the display brand. The commissioned XENEON EDGE unit
 exposes its touch controller as `wch.cn-touchscreen-1`, USB `27c0:0859`, rather
-than through the separate Corsair `1b1c:1d0d` control endpoint.
+than through the separate Corsair `1b1c:1d0d` control endpoint. That controller
+also has a mouse node with the same kernel name, and Hyprland suffixes whichever
+it enumerates second, so the recorded name stands for its family: the reconciler
+maps the one Hyprland touch device named `wch.cn-touchscreen` or
+`wch.cn-touchscreen-N`, and blocks when there is more than one.
 
 On a live user installation, the script first builds the candidate files in an
 isolated temporary root and checks the requested identity against real DRM,

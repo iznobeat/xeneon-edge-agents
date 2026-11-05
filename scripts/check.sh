@@ -271,23 +271,24 @@ print(sum(
         touch_match_count=$(
           python3 -c '
 import json
+import re
 import sys
 
 wanted = sys.argv[1]
+family = re.sub(r"-[0-9]+$", "", wanted)
+allowed = {wanted, family, family + "-1"}
 try:
     payload = json.load(sys.stdin)
 except (json.JSONDecodeError, TypeError):
     print(-1)
     raise SystemExit
 touch = payload.get("touch", [])
-print(sum(1 for device in touch if device.get("name") == wanted))
+print(sum(1 for device in touch if device.get("name") in allowed))
 ' "$touch_device" <<<"$devices_payload"
         )
+        # Hyprland's suffix follows enumeration order, so any name in the family
+        # counts here; the family check below rejects more than one.
         case "$touch_match_count" in
-          1)
-            printf 'ok: exact Hyprland touch device: %s\n' "$touch_device"
-            touch_inventory_valid=1
-            ;;
           -1)
             printf 'blocked: Hyprland touch-device inventory is invalid JSON\n'
             failures=$((failures + 1))
@@ -297,9 +298,8 @@ print(sum(1 for device in touch if device.get("name") == wanted))
             failures=$((failures + 1))
             ;;
           *)
-            printf 'blocked: configured Hyprland touch device is ambiguous (%d matches)\n' \
-              "$touch_match_count"
-            failures=$((failures + 1))
+            printf 'ok: Hyprland touch device in family of: %s\n' "$touch_device"
+            touch_inventory_valid=1
             ;;
         esac
       fi

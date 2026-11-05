@@ -463,6 +463,15 @@ test_production_commissioning_and_exact_check() {
     --screen-serial CX123456 --screen-model "XENEON EDGE" \
     "${production_touch_args[@]}" >/dev/null
 
+  # Hyprland's suffix follows enumeration order, so the unsuffixed name of the
+  # same touchscreen must also pass.
+  write_hypr_devices "$hypr_devices" wch.cn-touchscreen
+  "$check_script" --root "$root" --sys-root "$sys_root" \
+    --hypr-devices-json "$hypr_devices" \
+    --hypr-monitors-json "$hypr_monitors" >/dev/null ||
+    fail "unsuffixed Hyprland touch name was rejected"
+  write_hypr_devices "$hypr_devices" wch.cn-touchscreen-1
+
   assert_contains "$root/.config/xeneon-edge-agents/config.toml" 'serial = "CX123456"'
   assert_contains "$root/.config/xeneon-edge-agents/commissioning.toml" 'mode = "production"'
   assert_contains "$root/.config/xeneon-edge-agents/commissioning.toml" 'allow_primary_fallback = false'
@@ -1408,6 +1417,125 @@ EOF
     fail "stable reconciliation recycled an already-correct stack"
   fi
   assert_contains "$runtime/lifecycle.status" 'state=running'
+
+  # After a reboot Hyprland can name the same touchscreen without the suffix,
+  # leaving the configured name on the panel's mouse node. The touch device is
+  # the one to map, and the mouse must never get the output.
+  cat >"$devices" <<'EOF'
+{"mice":[{"address":"0x3","name":"wch.cn-touchscreen-1"}],"keyboards":[],"tablets":[],"touch":[{"address":"0x1","name":"wch.cn-touchscreen"}],"switches":[]}
+EOF
+  : >"$hyprctl_log"
+  env \
+    XDG_CONFIG_HOME="$root/.config" \
+    XENEON_SYS_ROOT="$sys_root" \
+    XENEON_HYPR_MONITORS_JSON="$monitors" \
+    XENEON_HYPR_DEVICES_JSON="$devices" \
+    XENEON_RUNTIME_DIR="$runtime" \
+    XENEON_SYSTEMCTL="$stub_bin/systemctl" \
+    XENEON_HYPRCTL="$stub_bin/hyprctl" \
+    SYSTEMCTL_LOG="$systemctl_log" \
+    HYPRCTL_LOG="$hyprctl_log" \
+    "$root/.local/bin/xeneon-edge-reconcile" >/dev/null
+  assert_contains "$runtime/lifecycle.status" 'state=running'
+  assert_contains "$hyprctl_log" \
+    'name = "wch.cn-touchscreen", output = "DP-2", enabled = true'
+  assert_contains "$hyprctl_log" 'name = "wch.cn-touchscreen", enabled = false'
+  assert_contains "$hyprctl_log" 'name = "wch.cn-touchscreen-1", enabled = false'
+  if grep -Fq 'name = "wch.cn-touchscreen-1", output' "$hyprctl_log"; then
+    fail "the panel's mouse node was mapped to the output"
+  fi
+
+  # Only names the disable paths cover may be enabled, and a near miss is
+  # another device.
+  local touch_name
+  for touch_name in wch.cn-touchscreen-2 wch.cn-touchscreenx wch.cn-touchscreen-a; do
+    write_hypr_devices "$devices" "$touch_name"
+    : >"$hyprctl_log"
+    env \
+      XDG_CONFIG_HOME="$root/.config" \
+      XENEON_SYS_ROOT="$sys_root" \
+      XENEON_HYPR_MONITORS_JSON="$monitors" \
+      XENEON_HYPR_DEVICES_JSON="$devices" \
+      XENEON_RUNTIME_DIR="$runtime" \
+      XENEON_SYSTEMCTL="$stub_bin/systemctl" \
+      XENEON_HYPRCTL="$stub_bin/hyprctl" \
+      SYSTEMCTL_LOG="$systemctl_log" \
+      HYPRCTL_LOG="$hyprctl_log" \
+      "$root/.local/bin/xeneon-edge-reconcile" >/dev/null
+    assert_contains "$runtime/lifecycle.status" 'state=blocked'
+    if grep -Fq 'enabled = true' "$hyprctl_log"; then
+      fail "unexpected touch name $touch_name was enabled"
+    fi
+  done
+
+  # A second panel with the same kernel name fails the identity but shares the
+  # Hyprland family, so a lone family match can't be trusted to be this panel.
+  write_hypr_devices "$devices" wch.cn-touchscreen
+  make_touchscreen_match \
+    "$sys_root" event92 OTHER-CONTROLLER usb-0000:00:14.0-9/input0
+  : >"$hyprctl_log"
+  env \
+    XDG_CONFIG_HOME="$root/.config" \
+    XENEON_SYS_ROOT="$sys_root" \
+    XENEON_HYPR_MONITORS_JSON="$monitors" \
+    XENEON_HYPR_DEVICES_JSON="$devices" \
+    XENEON_RUNTIME_DIR="$runtime" \
+    XENEON_SYSTEMCTL="$stub_bin/systemctl" \
+    XENEON_HYPRCTL="$stub_bin/hyprctl" \
+    SYSTEMCTL_LOG="$systemctl_log" \
+    HYPRCTL_LOG="$hyprctl_log" \
+    "$root/.local/bin/xeneon-edge-reconcile" >/dev/null
+  assert_contains "$runtime/lifecycle.status" 'state=blocked'
+  rm -f "$sys_root/class/input/event92"
+
+  # A failed disable still reaches every name, and stops the stack.
+  cat >"$stub_bin/hyprctl-failing" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$HYPRCTL_LOG"
+[[ "$*" != *'name = "wch.cn-touchscreen", enabled = false'* ]]
+EOF
+  chmod +x "$stub_bin/hyprctl-failing"
+  : >"$hyprctl_log"
+  : >"$systemctl_log"
+  if env \
+    XDG_CONFIG_HOME="$root/.config" \
+    XENEON_SYS_ROOT="$sys_root" \
+    XENEON_HYPR_MONITORS_JSON="$monitors" \
+    XENEON_HYPR_DEVICES_JSON="$devices" \
+    XENEON_RUNTIME_DIR="$runtime" \
+    XENEON_SYSTEMCTL="$stub_bin/systemctl" \
+    XENEON_HYPRCTL="$stub_bin/hyprctl-failing" \
+    SYSTEMCTL_LOG="$systemctl_log" \
+    HYPRCTL_LOG="$hyprctl_log" \
+    "$root/.local/bin/xeneon-edge-reconcile" >/dev/null; then
+    fail "a failed touch disable reported success"
+  fi
+  assert_contains "$hyprctl_log" 'name = "wch.cn-touchscreen-1", enabled = false'
+  assert_contains "$systemctl_log" \
+    '--user stop xeneon-edge-portal.service xeneon-agentd.service'
+  assert_contains "$runtime/lifecycle.status" 'state=failed'
+
+  # Two touch devices in the family can't be told apart, so nothing is enabled.
+  cat >"$devices" <<'EOF'
+{"mice":[],"keyboards":[],"tablets":[],"touch":[{"address":"0x1","name":"wch.cn-touchscreen"},{"address":"0x2","name":"wch.cn-touchscreen-1"}],"switches":[]}
+EOF
+  : >"$hyprctl_log"
+  env \
+    XDG_CONFIG_HOME="$root/.config" \
+    XENEON_SYS_ROOT="$sys_root" \
+    XENEON_HYPR_MONITORS_JSON="$monitors" \
+    XENEON_HYPR_DEVICES_JSON="$devices" \
+    XENEON_RUNTIME_DIR="$runtime" \
+    XENEON_SYSTEMCTL="$stub_bin/systemctl" \
+    XENEON_HYPRCTL="$stub_bin/hyprctl" \
+    SYSTEMCTL_LOG="$systemctl_log" \
+    HYPRCTL_LOG="$hyprctl_log" \
+    "$root/.local/bin/xeneon-edge-reconcile" >/dev/null
+  assert_contains "$runtime/lifecycle.status" 'state=blocked'
+  if grep -Fq 'enabled = true' "$hyprctl_log"; then
+    fail "ambiguous touch names enabled a device"
+  fi
+  write_hypr_devices "$devices" wch.cn-touchscreen-1
 
   : >"$systemctl_log"
   printf 'disconnected\n' >"$sys_root/devices/mock-drm/card0-DP-2/status"

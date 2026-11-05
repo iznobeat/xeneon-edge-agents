@@ -3,6 +3,13 @@
 -- lifecycle reconciliation when the commissioned screen changes, and keeps the
 -- game dashboard's window on the screen without borders or focus stealing.
 local touchDevice = "@TOUCH_DEVICE@"
+-- The panel's touchscreen and mouse nodes share a kernel name, and Hyprland
+-- suffixes whichever it enumerates second, so either name can be the touchscreen.
+local touchFamily = (touchDevice:gsub("%-%d+$", ""))
+local touchNames = { touchFamily, touchFamily .. "-1" }
+if touchDevice ~= touchNames[1] and touchDevice ~= touchNames[2] then
+  table.insert(touchNames, touchDevice)
+end
 local startReconcileCommand =
   "/usr/bin/systemctl --user start xeneon-edge-reconcile.service"
 local restartReconcileCommand =
@@ -12,10 +19,12 @@ local function disableTouch()
   -- A touch device bound to a removed output can fall back to the focused
   -- monitor. Disable it synchronously; the reconciler re-enables it only after
   -- the complete EDID, serial/model, and kernel touch identity passes.
-  hl.device({
-    name = touchDevice,
-    enabled = false,
-  })
+  for _, name in ipairs(touchNames) do
+    hl.device({
+      name = name,
+      enabled = false,
+    })
+  end
 end
 
 local function startReconcile()
