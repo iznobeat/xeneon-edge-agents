@@ -305,6 +305,7 @@ print(sum(1 for device in touch if device.get("name") in allowed))
       fi
 
       kernel_touch_match_count=0
+      kernel_family_node_count=0
       matched_kernel_base=
       while IFS= read -r -d '' event_path; do
         properties=
@@ -332,6 +333,7 @@ print(sum(1 for device in touch if device.get("name") in allowed))
             "$touch_name_suffix" =~ ^[0-9]+$ ]] ||
             continue
         fi
+        kernel_family_node_count=$((kernel_family_node_count + 1))
         [[ "${kernel_bustype,,}" == "${touch_bustype,,}" &&
           "${kernel_vendor,,}" == "${touch_vendor,,}" &&
           "${kernel_product,,}" == "${touch_product,,}" ]] ||
@@ -348,7 +350,15 @@ print(sum(1 for device in touch if device.get("name") in allowed))
           -mindepth 1 -maxdepth 1 -type d -name 'event*' -print0 2>/dev/null
       )
 
+      # Another panel sharing the kernel name would share the Hyprland name
+      # family, so the reconciler blocks on it; report the same here.
+      if ((kernel_touch_match_count == 1 && kernel_family_node_count != 1)); then
+        printf 'blocked: another touchscreen shares the kernel name of: %s\n' "$touch_device"
+        failures=$((failures + 1))
+        kernel_touch_match_count=-1
+      fi
       case "$kernel_touch_match_count" in
+        -1) ;;
         1)
           printf 'ok: exact USB touchscreen kernel identity\n'
           if ((touch_inventory_valid)); then

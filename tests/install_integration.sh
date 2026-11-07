@@ -685,8 +685,6 @@ test_touch_and_monitor_identity_fail_closed() {
   assert_contains "$log" 'touchscreen identity is ambiguous'
 
   rm -f "$sys_root/class/input/event91"
-  make_touchscreen_match \
-    "$sys_root" event92 OTHER-CONTROLLER usb-0000:00:14.0-9/input0
   cat >"$hypr_devices" <<'EOF'
 {"mice":[],"keyboards":[],"tablets":[],"touch":[{"address":"0x1","name":"wch.cn-touchscreen"},{"address":"0x2","name":"wch.cn-touchscreen-1"}],"switches":[]}
 EOF
@@ -696,6 +694,18 @@ EOF
     fail "same-base Hyprland touchscreen ambiguity unexpectedly passed"
   fi
   assert_contains "$log" 'Hyprland touchscreen name family is ambiguous'
+
+  # A second panel with the same kernel name blocks even when Hyprland lists
+  # one family name, as the reconciler does: that name may be the other panel.
+  make_touchscreen_match \
+    "$sys_root" event92 OTHER-CONTROLLER usb-0000:00:14.0-9/input0
+  write_hypr_devices "$hypr_devices" wch.cn-touchscreen-1
+  if "$check_script" --root "$root" --sys-root "$sys_root" \
+    --hypr-devices-json "$hypr_devices" \
+    --hypr-monitors-json "$hypr_monitors" >"$log" 2>&1; then
+    fail "a second panel sharing the kernel name unexpectedly passed"
+  fi
+  assert_contains "$log" 'another touchscreen shares the kernel name'
 
   rm -f "$sys_root/class/input/event92"
   write_hypr_devices "$hypr_devices" wch.cn-touchscreen-1

@@ -232,7 +232,7 @@ impl DesktopController {
         match select_desktop_candidate(&clients, spec)? {
             Some(client) => {
                 self.launching_since.lock().await.remove(&app);
-                self.focus_off_edge(client).await?;
+                self.focus_off_edge(client, &clients).await?;
                 Ok(DesktopAppOutcome::Focused)
             }
             None => {
@@ -257,21 +257,41 @@ impl DesktopController {
 
     /// Focuses an app the portal opened, first sending it to another monitor
     /// when it sits on the EDGE: the portal's overlay would hide it there. With
-    /// no other monitor it stays put, since the EDGE is then all there is.
-    async fn focus_off_edge(&self, client: &HyprClient) -> Result<()> {
-        if let Some(edge) = self.config.edge_output.as_deref() {
-            let monitors =
-                hypr_json::<Vec<HyprMonitor>>(&self.hyprctl_bin, &["monitors", "-j"]).await?;
-            if let Some(target) = off_edge_target(&monitors, client.monitor, edge) {
-                dispatch(
-                    &self.hyprctl_bin,
-                    &move_to_monitor_expression(&client.address, &target.name)?,
-                )
-                .await
-                .context("moving a desktop app off the EDGE")?;
-            }
+    /// no other monitor it stays put, since the EDGE is then all there is. The
+    /// move is best effort: the app is focused even when it fails.
+    async fn focus_off_edge(&self, client: &HyprClient, clients: &[HyprClient]) -> Result<()> {
+        if let Some(edge) = self.config.edge_output.as_deref()
+            && let Err(error) = self.move_off_edge(client, clients, edge).await
+        {
+            tracing::warn!(%error, "desktop app stays on the EDGE");
         }
         dispatch_focus(&self.hyprctl_bin, &client.address).await
+    }
+
+    async fn move_off_edge(
+        &self,
+        client: &HyprClient,
+        clients: &[HyprClient],
+        edge: &str,
+    ) -> Result<()> {
+        let monitors =
+            hypr_json::<Vec<HyprMonitor>>(&self.hyprctl_bin, &["monitors", "-j"]).await?;
+        let remembered = self.remembered_window.lock().await.clone();
+        let remembered_monitor = remembered.and_then(|address| {
+            clients
+                .iter()
+                .find(|candidate| candidate.address == address)
+                .map(|candidate| candidate.monitor)
+        });
+        if let Some(target) = off_edge_target(&monitors, client.monitor, edge, remembered_monitor) {
+            dispatch(
+                &self.hyprctl_bin,
+                &move_to_monitor_expression(&client.address, &target.name)?,
+            )
+            .await
+            .context("moving a desktop app off the EDGE")?;
+        }
+        Ok(())
     }
 
     async fn wait_for_launched_client(
@@ -299,7 +319,7 @@ impl DesktopController {
             match candidate {
                 Some(client) => {
                     self.launching_since.lock().await.remove(&app);
-                    self.focus_off_edge(client).await?;
+                    self.focus_off_edge(client, &clients).await?;
                     return Ok(DesktopAppOutcome::LaunchedAndFocused);
                 }
                 None if Instant::now() < deadline => sleep(self.launch_poll_interval).await,
@@ -575,13 +595,15 @@ fn desktop_app_spec(config: &DesktopConfig, app: DesktopApp) -> Result<DesktopAp
     }
 }
 
-/// Where a window on the EDGE should go: the focused other monitor, or else the
-/// lowest-numbered one. Nothing when the window is elsewhere or the EDGE is the
-/// only monitor.
+/// Where a window on the EDGE should go: the focused other monitor, else the
+/// monitor of the last window used off the EDGE (touching the portal focuses
+/// the EDGE), else the lowest-numbered one. Nothing when the window is
+/// elsewhere or the EDGE is the only monitor.
 fn off_edge_target<'m>(
     monitors: &'m [HyprMonitor],
     client_monitor: i64,
     edge_output: &str,
+    remembered_monitor: Option<i64>,
 ) -> Option<&'m HyprMonitor> {
     monitors
         .iter()
@@ -589,7 +611,13 @@ fn off_edge_target<'m>(
     monitors
         .iter()
         .filter(|monitor| monitor.name != edge_output)
-        .min_by_key(|monitor| (!monitor.focused, monitor.id))
+        .min_by_key(|monitor| {
+            (
+                !monitor.focused,
+                Some(monitor.id) != remembered_monitor,
+                monitor.id,
+            )
+        })
 }
 
 fn is_game_client(client: &HyprClient) -> bool {
@@ -1395,7 +1423,24 @@ mod tests {
             (2, "DP-2", false),
             (3, "HDMI-A-1", true),
         ]);
-        assert_eq!(off_edge_target(&all, 2, "DP-2").unwrap().name, "HDMI-A-1");
+        assert_eq!(
+            off_edge_target(&all, 2, "DP-2", Some(1)).unwrap().name,
+            "HDMI-A-1"
+        );
+    }
+
+    #[test]
+    fn off_edge_target_follows_the_last_window_used_when_the_edge_has_focus() {
+        let all = monitors(&[(1, "eDP-1", false), (2, "DP-2", true), (3, "DP-1", false)]);
+        assert_eq!(
+            off_edge_target(&all, 2, "DP-2", Some(3)).unwrap().name,
+            "DP-1"
+        );
+        // A remembered window on the EDGE itself names no other monitor.
+        assert_eq!(
+            off_edge_target(&all, 2, "DP-2", Some(2)).unwrap().name,
+            "eDP-1"
+        );
     }
 
     #[test]
@@ -1405,15 +1450,15 @@ mod tests {
             (2, "DP-2", true),
             (1, "DP-1", false),
         ]);
-        assert_eq!(off_edge_target(&all, 2, "DP-2").unwrap().name, "DP-1");
+        assert_eq!(off_edge_target(&all, 2, "DP-2", None).unwrap().name, "DP-1");
     }
 
     #[test]
     fn off_edge_target_leaves_other_windows_and_a_lone_edge_alone() {
         let all = monitors(&[(1, "DP-1", true), (2, "DP-2", false)]);
-        assert!(off_edge_target(&all, 1, "DP-2").is_none());
+        assert!(off_edge_target(&all, 1, "DP-2", None).is_none());
         let lone = monitors(&[(2, "DP-2", true)]);
-        assert!(off_edge_target(&lone, 2, "DP-2").is_none());
+        assert!(off_edge_target(&lone, 2, "DP-2", Some(2)).is_none());
     }
 
     /// Runs `focus_or_launch` for Spotify against a fake Hyprland showing it on
@@ -1466,6 +1511,49 @@ fi
                 "hl.dsp.window.move({ monitor = \"DP-1\", window = \"address:0xabc\" })",
                 "hl.dsp.focus({ window = \"address:0xabc\" })",
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_move_off_the_edge_still_focuses_the_app() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = temp.path().join("dispatch.log");
+        let hyprctl = temp.path().join("hyprctl");
+        write_executable(
+            &hyprctl,
+            &format!(
+                r#"#!/bin/sh
+if [ "$1" = "clients" ]; then
+  printf '%s\n' '[{{"address":"0xabc","class":"spotify","initialClass":"spotify","title":"Spotify","pid":42,"monitor":2}}]'
+elif [ "$1" = "monitors" ]; then
+  printf '%s\n' '[{{"id":1,"name":"DP-1","focused":false}},{{"id":2,"name":"DP-2","focused":true}}]'
+elif [ "$1" = "dispatch" ]; then
+  printf '%s\n' "$2" >> "{log}"
+  case "$2" in
+    *window.move*) printf '%s\n' 'Invalid monitor'; exit 7 ;;
+  esac
+  printf '%s\n' 'ok'
+fi
+"#,
+                log = log.display()
+            ),
+        );
+        let mut controller = DesktopController::new(DesktopConfig {
+            edge_output: Some("DP-2".into()),
+            ..DesktopConfig::default()
+        });
+        controller.hyprctl_bin = hyprctl;
+        assert_eq!(
+            controller
+                .focus_or_launch(DesktopApp::Configured(0))
+                .await
+                .unwrap(),
+            DesktopAppOutcome::Focused
+        );
+        let dispatches = fs::read_to_string(log).unwrap();
+        assert_eq!(
+            dispatches.lines().last(),
+            Some("hl.dsp.focus({ window = \"address:0xabc\" })")
         );
     }
 

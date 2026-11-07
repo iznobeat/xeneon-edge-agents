@@ -444,6 +444,12 @@ verification, installation, and the live handoff.
 - Portal-opened apps move off the EDGE before focus. Live on 2026-11-05 with the
   EDGE focused, a `desktop_app` command through `qml-bridge` mapped Spotify on
   `DP-2` workspace 11 and it moved to `DP-1` workspace 1.
+- Independent review of `fix/edge-touch-name-and-app-placement` (Claude Opus,
+  read-only, 2026-11-07) found no P0-P2 issues. Its P3 findings are fixed: a
+  failed off-EDGE move still focuses the app, an EDGE-focused open follows the
+  monitor of the last window used off the EDGE, and `check.sh` blocks like the
+  reconciler when another touchscreen shares the kernel name. Touch
+  re-enumeration mid-session is already covered by `xeneon-edge-input.path`.
 - The persisted home layout places the 1280x360 logical EDGE at `560,1350`,
   centered below the 2400x1350 logical external display, with the laptop
   immediately to its right at `1840,1350`. The external display is running at
