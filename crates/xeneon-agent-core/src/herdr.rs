@@ -40,7 +40,7 @@ const SPACE_LABEL: &str = "herdr.space";
 const WHERE_LABEL: &str = "where";
 /// Fact changes that cannot change a card. Titles repaint many times a
 /// second while an agent works, so they must never trigger a refresh.
-const IGNORED_EVENTS: [&str; 2] = ["title", "size"];
+const IGNORED_EVENTS: [&str; 4] = ["title", "size", "turn", "keep"];
 
 #[derive(Debug, Clone)]
 pub struct HerdrClient {
@@ -215,7 +215,6 @@ impl HerdrClient {
             if let Err(error) = watch_events(&descriptor, &invalidations, ready_tx).await {
                 tracing::warn!(session = %descriptor.name, %error, "herdr-core event subscription ended");
             }
-            let _ = invalidations.try_send(descriptor.name);
         });
         (handle, ready_rx)
     }
@@ -272,7 +271,9 @@ fn build_agents(
     let mut targets = HashMap::new();
 
     for raw in terminals {
-        if raw.state != "live" {
+        // `machine/t3` lives on another machine: its folder is not this
+        // filesystem, and the local Herdr app cannot be asked about it here.
+        if raw.state != "live" || raw.address.contains('/') {
             continue;
         }
         let Some(status) = raw.status.as_ref() else {
@@ -487,7 +488,10 @@ async fn watch_events(
     let id = request_id();
     // The write half stays alive for the whole stream: closing it is how a
     // client ends its subscription.
-    let (mut lines, _write) = match subscribe(&descriptor.socket_path, &id).await {
+    // A subscription that never starts reports only through `ready`: the
+    // daemon marks the session stale and its repair tick retries, instead of
+    // an invalidation that would retry at once and loop.
+    let (mut lines, _write, mut words) = match subscribe(&descriptor.socket_path, &id).await {
         Ok(stream) => stream,
         Err(error) => {
             let _ = ready.send(Err(format!("{error:#}")));
@@ -496,22 +500,76 @@ async fn watch_events(
     };
     let _ = ready.send(Ok(()));
 
-    while let Some(line) = lines.next_line().await? {
-        let Ok(message) = serde_json::from_str::<Value>(&line) else {
-            continue;
-        };
-        if invalidates(&message) {
-            let _ = invalidations.try_send(descriptor.name.clone());
+    let ended = async {
+        while let Some(line) = lines.next_line().await? {
+            let Ok(message) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            if words.invalidates(&message) {
+                let _ = invalidations.try_send(descriptor.name.clone());
+            }
+        }
+        bail!("herdr-core subscription reached EOF")
+    }
+    .await;
+    // A stream that ran and then ended needs a fresh roster.
+    let _ = invalidations.try_send(descriptor.name.clone());
+    ended
+}
+
+/// Each terminal's last status word, so a `status` event that changes only
+/// the program's message or progress does not refresh the roster.
+#[derive(Debug, Default)]
+struct StatusWords(HashMap<String, Option<String>>);
+
+impl StatusWords {
+    fn seed(&mut self, terminals: &Value) {
+        self.0.clear();
+        for terminal in terminals.as_array().into_iter().flatten() {
+            if let Some(address) = terminal["address"].as_str() {
+                self.0
+                    .insert(address.to_owned(), status_word(&terminal["status"]));
+            }
         }
     }
-    bail!("herdr-core subscription reached EOF")
+
+    /// Whether a subscription message can change the roster. Unknown fact
+    /// types invalidate, so a newer core fails toward refreshing, never
+    /// toward a stale card; a `missed` notice means changes were dropped.
+    fn invalidates(&mut self, message: &Value) -> bool {
+        let params = &message["params"];
+        match message.get("method").and_then(Value::as_str) {
+            Some("event") => match params["type"].as_str() {
+                Some(kind) if IGNORED_EVENTS.contains(&kind) => false,
+                Some("status") => {
+                    let Some(terminal) = params["terminal"].as_str() else {
+                        return true;
+                    };
+                    let word = status_word(&params["data"]["status"]);
+                    self.0.insert(terminal.to_owned(), word.clone()) != Some(word)
+                }
+                _ => true,
+            },
+            Some("heartbeat") => false,
+            Some("missed") => {
+                self.seed(&params["terminals"]);
+                true
+            }
+            Some(_) => true,
+            None => false,
+        }
+    }
+}
+
+fn status_word(status: &Value) -> Option<String> {
+    status["state"].as_str().map(str::to_owned)
 }
 
 type Lines = tokio::io::Lines<BufReader<OwnedReadHalf>>;
 
 /// Opens an event stream and waits for the subscription's snapshot reply,
 /// which is the acknowledgement that every later fact change will arrive.
-async fn subscribe(socket: &Path, id: &str) -> Result<(Lines, OwnedWriteHalf)> {
+async fn subscribe(socket: &Path, id: &str) -> Result<(Lines, OwnedWriteHalf, StatusWords)> {
     let request = json!({
         "jsonrpc": "2.0",
         "id": id,
@@ -542,21 +600,9 @@ async fn subscribe(socket: &Path, id: &str) -> Result<(Lines, OwnedWriteHalf)> {
     if !result["seq"].is_u64() || !result["terminals"].is_array() {
         bail!("unexpected subscription acknowledgement");
     }
-    Ok((lines, write))
-}
-
-/// Whether a subscription message can change the roster. Unknown fact types
-/// invalidate, so a newer core fails toward refreshing, never toward a
-/// stale card; a `missed` notice means changes were dropped.
-fn invalidates(message: &Value) -> bool {
-    match message.get("method").and_then(Value::as_str) {
-        Some("event") => message["params"]["type"]
-            .as_str()
-            .is_none_or(|kind| !IGNORED_EVENTS.contains(&kind)),
-        Some("heartbeat") => false,
-        Some(_) => true,
-        None => false,
-    }
+    let mut words = StatusWords::default();
+    words.seed(&result["terminals"]);
+    Ok((lines, write, words))
 }
 
 async fn core_request<T: for<'de> Deserialize<'de>>(
@@ -693,6 +739,11 @@ mod tests {
                 "t4",
                 json!({"state": "finished", "labels": herdr_labels("lectern / 1"),
                     "status": {"app": "codex", "state": "idle"}}),
+            ),
+            // Another machine's terminal is not this filesystem's.
+            record(
+                "vps/t1",
+                json!({"labels": herdr_labels("vps / 1"), "status": {"state": "working"}}),
             ),
             // A sub-agent belongs to its parent's space and tab.
             record(
@@ -838,18 +889,31 @@ mod tests {
     fn only_card_relevant_facts_invalidate() {
         let event =
             |kind: &str| json!({"jsonrpc": "2.0", "method": "event", "params": {"type": kind}});
-        assert!(!invalidates(&event("title")));
-        assert!(!invalidates(&event("size")));
-        assert!(!invalidates(
-            &json!({"method": "heartbeat", "params": {"seq": 1}})
-        ));
-        for kind in [
-            "status", "created", "finished", "removed", "labels", "doc", "new",
-        ] {
-            assert!(invalidates(&event(kind)), "{kind}");
+        let status = |terminal: &str, word: Value| {
+            json!({"method": "event", "params": {"type": "status", "terminal": terminal,
+                "data": {"status": word}}})
+        };
+        let mut words = StatusWords::default();
+        words.seed(&json!([
+            {"address": "t1", "status": {"state": "working"}},
+            {"address": "t2", "status": null}
+        ]));
+        for kind in ["title", "size", "turn", "keep"] {
+            assert!(!words.invalidates(&event(kind)), "{kind}");
         }
-        assert!(invalidates(&json!({"method": "missed", "params": {}})));
-        assert!(!invalidates(&json!({"id": "x", "result": {}})));
+        assert!(!words.invalidates(&json!({"method": "heartbeat", "params": {"seq": 1}})));
+        for kind in ["created", "finished", "removed", "labels", "doc", "new"] {
+            assert!(words.invalidates(&event(kind)), "{kind}");
+        }
+        // Progress and messages leave the word alone.
+        assert!(!words.invalidates(&status("t1", json!({"state": "working", "progress": 40}))));
+        assert!(words.invalidates(&status("t1", json!({"state": "blocked"}))));
+        assert!(!words.invalidates(&status("t1", json!({"state": "blocked", "msg": "x"}))));
+        assert!(words.invalidates(&status("t2", json!({"state": "idle"}))));
+        assert!(words.invalidates(&status("t9", json!({"state": "idle"}))));
+        assert!(words.invalidates(&status("t9", Value::Null)));
+        assert!(words.invalidates(&json!({"method": "missed", "params": {"terminals": []}})));
+        assert!(!words.invalidates(&json!({"id": "x", "result": {}})));
     }
 
     #[tokio::test]
@@ -1098,7 +1162,7 @@ mod tests {
             name: "default".into(),
             socket_path: socket,
         };
-        let (invalidations_tx, _) = mpsc::channel(1);
+        let (invalidations_tx, mut invalidations_rx) = mpsc::channel(1);
         let (ready_tx, ready_rx) = oneshot::channel();
         assert!(
             watch_events(&descriptor, &invalidations_tx, ready_tx)
@@ -1106,6 +1170,8 @@ mod tests {
                 .is_err()
         );
         assert!(ready_rx.await.unwrap().is_err());
+        // Retrying at once would loop; the repair tick retries instead.
+        assert!(invalidations_rx.try_recv().is_err());
         server.await.unwrap();
     }
 }

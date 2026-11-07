@@ -415,6 +415,17 @@ impl Default for DesktopConfig {
     }
 }
 
+impl DesktopConfig {
+    /// Configs written for the legacy Herdr name its terminal window class,
+    /// `herdr`; Herdr is now the Herdr app, whose window class is
+    /// `herdr-app`. Only that exact legacy value is migrated.
+    fn migrate_legacy_herdr_class(&mut self) {
+        if self.herdr_class == "herdr" {
+            self.herdr_class = "herdr-app".into();
+        }
+    }
+}
+
 impl Config {
     pub fn load(path: Option<&Path>) -> Result<Self> {
         let runtime_output = env::var_os("XENEON_EDGE_OUTPUT");
@@ -478,6 +489,7 @@ impl Config {
                 config.game = game;
             }
         }
+        config.desktop.migrate_legacy_herdr_class();
         config.apply_runtime_output(runtime_output)?;
         Ok(config)
     }
@@ -743,6 +755,17 @@ mod tests {
             Path::new("/home/u/.config/herdr-app/herdr-app.sock")
         );
         assert_eq!(parsed.desktop.herdr_class, "herdr-app");
+
+        // An installed config still naming the legacy Herdr class loads with
+        // the Herdr app's class; any other configured class is kept.
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        fs::write(&path, "[desktop]\nherdr_class = \"herdr\"\n").unwrap();
+        let legacy = Config::load_with_runtime_output(Some(&path), None).unwrap();
+        assert_eq!(legacy.desktop.herdr_class, "herdr-app");
+        fs::write(&path, "[desktop]\nherdr_class = \"my-herdr\"\n").unwrap();
+        let custom = Config::load_with_runtime_output(Some(&path), None).unwrap();
+        assert_eq!(custom.desktop.herdr_class, "my-herdr");
 
         let relative: Config = toml::from_str("[herdr]\ncore_socket = \"core.sock\"\n").unwrap();
         assert!(relative.validate().is_err());
