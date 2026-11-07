@@ -271,9 +271,7 @@ fn build_agents(
     let mut targets = HashMap::new();
 
     for raw in terminals {
-        // `machine/t3` lives on another machine: its folder is not this
-        // filesystem, and the local Herdr app cannot be asked about it here.
-        if raw.state != "live" || raw.address.contains('/') {
+        if raw.state != "live" {
             continue;
         }
         let Some(status) = raw.status.as_ref() else {
@@ -295,7 +293,12 @@ fn build_agents(
             .as_ref()
             .and_then(|foreground| foreground.cwd.as_deref())
             .unwrap_or(&raw.cwd);
-        let location = git_location(cwd);
+        // `machine/t3` runs on another machine the Herdr app also shows; its
+        // folder is not on this filesystem, so only its leaf name is used.
+        let location = machine(&raw.address)
+            .is_none()
+            .then(|| git_location(cwd))
+            .flatten();
         let id = opaque_agent_id(daemon_epoch, session, &raw.address);
         let state_change_seq = raw.status_ms.unwrap_or_default();
 
@@ -357,8 +360,20 @@ fn herdr_home<'a>(
         if !seen.insert(current.address.as_str()) || seen.len() > 32 {
             return None;
         }
-        current = by_address.get(current.parent.as_deref()?)?;
+        let parent = current.parent.as_deref()?;
+        // A parent is named on its own machine, so a remote `t3` is
+        // `machine/t3` here.
+        let parent = match (machine(&current.address), parent.contains('/')) {
+            (Some(machine), false) => format!("{machine}/{parent}"),
+            _ => parent.to_owned(),
+        };
+        current = by_address.get(parent.as_str())?;
     }
+}
+
+/// The machine prefix of a remote address (`solheim` in `solheim/t3`).
+fn machine(address: &str) -> Option<&str> {
+    address.split_once('/').map(|(machine, _)| machine)
 }
 
 /// The Herdr app writes `where` as `<space> / <tab>`.
@@ -745,10 +760,16 @@ mod tests {
                 json!({"state": "finished", "labels": herdr_labels("lectern / 1"),
                     "status": {"app": "codex", "state": "idle"}}),
             ),
-            // Another machine's terminal is not this filesystem's.
+            // Another machine's agent is shown too, without reading its
+            // remote folder here; its sub-agent names a parent on that machine.
             record(
                 "vps/t1",
-                json!({"labels": herdr_labels("vps / 1"), "status": {"state": "working"}}),
+                json!({"labels": herdr_labels("deploy / 1"), "cwd": "/srv/app",
+                    "status": {"app": "codex", "state": "working"}}),
+            ),
+            record(
+                "vps/t2",
+                json!({"parent": "t1", "name": "helper", "status": {"state": "idle"}}),
             ),
             // A sub-agent belongs to its parent's space and tab.
             record(
@@ -767,7 +788,7 @@ mod tests {
             3,
         );
 
-        assert_eq!(agents.len(), 2);
+        assert_eq!(agents.len(), 4);
         assert_eq!(agents[0].display_name, "lectern-qt");
         assert_eq!(agents[0].agent, "codex");
         assert_eq!(agents[0].workspace, "lectern");
@@ -780,12 +801,19 @@ mod tests {
         assert!(agents[0].actions.approve.is_none());
         assert!(agents[0].actions.interrupt.is_none());
 
-        assert_eq!(agents[1].display_name, "review");
-        assert_eq!(agents[1].status, AgentStatus::Blocked);
-        assert_eq!(agents[1].workspace, "lectern");
-        assert!(agents[1].focused);
-        assert_eq!(agents[1].source_order, 4);
-        assert_eq!(targets[&agents[1].id].terminal, "t5");
+        assert_eq!(agents[1].display_name, "codex · deploy");
+        assert_eq!(agents[1].repository.as_deref(), Some("app"));
+        assert_eq!(agents[1].branch, None);
+        assert_eq!(targets[&agents[1].id].terminal, "vps/t1");
+        assert_eq!(agents[2].display_name, "helper");
+        assert_eq!(agents[2].workspace, "deploy");
+
+        assert_eq!(agents[3].display_name, "review");
+        assert_eq!(agents[3].status, AgentStatus::Blocked);
+        assert_eq!(agents[3].workspace, "lectern");
+        assert!(agents[3].focused);
+        assert_eq!(agents[3].source_order, 6);
+        assert_eq!(targets[&agents[3].id].terminal, "t5");
 
         // Prompt-bearing fields never reach the portal model.
         let encoded = serde_json::to_string(&agents).unwrap();

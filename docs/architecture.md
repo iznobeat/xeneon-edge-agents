@@ -62,7 +62,10 @@ as the repair path.
 An agent is a live herdr-core terminal whose program reports an OSC 7501
 status and that the Herdr app shows: it carries the app's `herdr.space`
 label, or descends through `parent` links (bounded, cycle-safe) from one that
-does, which places sub-agents in their parent's space. `working`, `blocked`,
+does, which places sub-agents in their parent's space. Agents on other machines the
+app shows arrive as `machine/tN`; their parent links resolve on that machine,
+and their folders are not read on this one, so they carry only the folder's
+leaf name and no branch. `working`, `blocked`,
 `done`, and `idle` keep their meaning; `error` needs a person and maps to
 `blocked`. `status_ms` is the state-change sequence. Status messages, titles,
 argv, and screen contents can carry prompt text and are never read into the
