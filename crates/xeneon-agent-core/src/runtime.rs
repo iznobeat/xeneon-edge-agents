@@ -150,7 +150,6 @@ struct RuntimeState {
     backend: AgentBackend,
     t3code_order: AgentOrderMode,
     herdr_order: AgentOrderMode,
-    herdr_order_daemon_owned: bool,
     /// URLs of published Basecamp items by id; never sent to the portal.
     basecamp_urls: HashMap<String, String>,
     /// `slack://` deep links of published Slack messages by id; never sent to
@@ -176,7 +175,6 @@ struct ObservedAgent {
 
 #[derive(Debug)]
 struct Subscription {
-    pane_ids: Vec<String>,
     handle: JoinHandle<()>,
 }
 
@@ -249,7 +247,7 @@ impl DaemonRuntime {
         let github = GithubClient::new(config.github.clone());
         Ok((
             Self {
-                herdr: HerdrClient::new(config.herdr_bin.clone()),
+                herdr: herdr_client(&config),
                 t3code,
                 backend_state_path,
                 config,
@@ -258,7 +256,6 @@ impl DaemonRuntime {
                     backend: persisted.backend,
                     t3code_order: persisted.t3code_order,
                     herdr_order: persisted.herdr_order,
-                    herdr_order_daemon_owned: false,
                     basecamp_urls: HashMap::new(),
                     slack_urls: HashMap::new(),
                     github_urls: HashMap::new(),
@@ -737,7 +734,6 @@ impl DaemonRuntime {
                     agent.actions = AgentActions::default();
                 }
                 state.snapshot.agent_order = AgentOrderSnapshot::default();
-                state.herdr_order_daemon_owned = false;
                 sort_agents(&mut state.snapshot.agents);
                 state.targets.clear();
                 state.snapshot.sequence = state.snapshot.sequence.saturating_add(1);
@@ -754,8 +750,6 @@ impl DaemonRuntime {
         let mut agents = Vec::new();
         let mut targets = HashMap::new();
         let mut connected = 0usize;
-        let mut order_modes = Vec::new();
-        let mut daemon_owned_order_sessions = 0usize;
         let mut source_offset = 0usize;
         let mut active_names = Vec::new();
 
@@ -767,18 +761,10 @@ impl DaemonRuntime {
                 .await
             {
                 Ok(mut observation) => {
-                    if observation.session.state == SessionState::Incompatible {
-                        if let Some(subscription) = subscriptions.remove(&descriptor.name) {
-                            subscription.handle.abort();
-                        }
-                        sessions.push(observation.session);
-                        continue;
-                    }
                     match update_subscription(
                         subscriptions,
                         &self.herdr,
                         descriptor,
-                        observation.pane_ids.clone(),
                         self.invalidations.clone(),
                     )
                     .await
@@ -794,18 +780,7 @@ impl DaemonRuntime {
                                 )
                                 .await
                             {
-                                Ok(reconciled) => {
-                                    if reconciled.session.state == SessionState::Incompatible {
-                                        if let Some(subscription) =
-                                            subscriptions.remove(&descriptor.name)
-                                        {
-                                            subscription.handle.abort();
-                                        }
-                                        sessions.push(reconciled.session);
-                                        continue;
-                                    }
-                                    observation = reconciled;
-                                }
+                                Ok(reconciled) => observation = reconciled,
                                 Err(error) => {
                                     tracing::warn!(
                                         session = %descriptor.name,
@@ -862,12 +837,6 @@ impl DaemonRuntime {
                         }
                     }
                     connected += 1;
-                    if let Some(mode) = observation.agent_order {
-                        order_modes.push(mode);
-                    }
-                    if observation.daemon_owned_order {
-                        daemon_owned_order_sessions += 1;
-                    }
                     source_offset += observation.agents.len();
                     sessions.push(observation.session);
                     targets.extend(
@@ -924,19 +893,10 @@ impl DaemonRuntime {
             ..
         } = &mut *state;
         apply_agent_observations(&mut agents, &targets, observed, focused_agents, now);
+        // herdr-core has no ordering preference of its own, so the daemon owns
+        // it while the roster is authoritative.
         let all_connected = !descriptors.is_empty() && connected == descriptors.len();
-        // A mixed roster keeps ordering unavailable: the daemon cannot both
-        // follow fork servers and override them with its own preference.
-        let daemon_owned = all_connected && daemon_owned_order_sessions == connected;
-        let agent_order = if all_connected
-            && order_modes.len() == connected
-            && order_modes.iter().all(|mode| *mode == order_modes[0])
-        {
-            AgentOrderSnapshot {
-                available: true,
-                mode: order_modes[0],
-            }
-        } else if daemon_owned {
+        let agent_order = if all_connected {
             AgentOrderSnapshot {
                 available: true,
                 mode: state.herdr_order,
@@ -944,7 +904,6 @@ impl DaemonRuntime {
         } else {
             AgentOrderSnapshot::default()
         };
-        state.herdr_order_daemon_owned = daemon_owned;
         apply_agent_order(&mut agents, &agent_order);
         state.snapshot.sessions = sessions;
         state.snapshot.agents = agents;
@@ -1375,56 +1334,37 @@ impl DaemonRuntime {
                 };
             }
         };
-        match self
-            .herdr
-            .perform(
-                &herdr_target,
-                command.action,
-                command.capability_id.as_deref(),
-            )
-            .await
-        {
-            Ok(()) => {
-                if command.action == ActionKind::Open {
-                    self.acknowledge_review_ready(&agent.id).await;
-                }
-                // Herdr already committed the focus/zoom operation. Refresh
-                // authoritative state even if compositor activation then
-                // fails, so the portal never retains a stale review badge.
-                let _ = self.invalidations.try_send(herdr_target.session.clone());
-                if matches!(command.action, ActionKind::Open | ActionKind::Zoom)
-                    && let Err(error) = self
-                        .desktop
-                        .activate_herdr(&herdr_target.session, &herdr_target.socket_path)
-                        .await
-                {
-                    tracing::warn!(%error, "Herdr window activation failed after agent focus");
-                    return action_error(
-                        &command.request_id,
-                        "target_unavailable",
-                        "agent focused, but its Herdr window was not activated",
-                    );
-                }
-                action_ok(&command.request_id, "action_completed")
-            }
-            Err(error) => {
-                let message = error.to_string();
-                let code = if message.contains("protocol") {
-                    "unsupported_protocol"
-                } else if message.contains("state") || message.contains("capability") {
-                    "agent_state_changed"
-                } else {
-                    "command_error"
-                };
-                tracing::warn!(%error, action = ?command.action, "Herdr action failed");
-                let public_message = match code {
-                    "unsupported_protocol" => "Herdr protocol is unsupported",
-                    "agent_state_changed" => "agent state changed before the action",
-                    _ => "agent action failed",
-                };
-                action_error(&command.request_id, code, public_message)
-            }
+        // herdr-core offers no zoom or guarded actions; only focus reaches
+        // the Herdr app, as one typed command for this exact terminal.
+        if command.action != ActionKind::Open {
+            return action_error(
+                &command.request_id,
+                "target_unavailable",
+                "action is not available for Herdr agents",
+            );
         }
+        if let Err(error) = self.herdr.focus(&herdr_target).await {
+            tracing::warn!(%error, "Herdr agent focus failed");
+            let _ = self.invalidations.try_send(herdr_target.session.clone());
+            return action_error(
+                &command.request_id,
+                "target_unavailable",
+                "the Herdr app could not show this agent",
+            );
+        }
+        self.acknowledge_review_ready(&agent.id).await;
+        // The app already shows the agent. Refresh authoritative state even if
+        // compositor activation then fails, so no stale review badge remains.
+        let _ = self.invalidations.try_send(herdr_target.session.clone());
+        if let Err(error) = self.desktop.focus_existing(DesktopApp::Herdr).await {
+            tracing::warn!(%error, "Herdr window activation failed after agent focus");
+            return action_error(
+                &command.request_id,
+                "target_unavailable",
+                "agent focused, but the Herdr window was not activated",
+            );
+        }
+        action_ok(&command.request_id, "action_completed")
     }
 
     async fn process_agent_order_command(&self, command: &PortalCommand) -> ActionResult {
@@ -1443,150 +1383,15 @@ impl DaemonRuntime {
             ActionKind::OrderPriority => AgentOrderMode::Priority,
             _ => unreachable!("ordering command filtered before dispatch"),
         };
-        // Decide and apply under one write lock, so a Herdr refresh cannot
-        // change who owns ordering in between.
+        // Neither manager has an ordering preference of its own, so the
+        // daemon owns this typed setting for each roster. Apply it under one
+        // write lock, so a refresh cannot publish in between.
         let mut state = self.state.write().await;
-        if state.backend == AgentBackend::T3code || state.herdr_order_daemon_owned {
-            // T3 Code and stock Herdr have no ordering preference of their
-            // own, so the daemon owns this typed setting for those rosters.
-            if state.backend == AgentBackend::T3code {
-                state.t3code_order = mode;
-            } else {
-                state.herdr_order = mode;
-            }
-            state.snapshot.agent_order = AgentOrderSnapshot {
-                available: true,
-                mode,
-            };
-            let ordering = state.snapshot.agent_order.clone();
-            apply_agent_order(&mut state.snapshot.agents, &ordering);
-            state.snapshot.sequence = state.snapshot.sequence.saturating_add(1);
-            state.snapshot.generated_at_ms = now_ms();
-            let persisted = PersistedBackend {
-                backend: state.backend,
-                t3code_order: state.t3code_order,
-                herdr_order: state.herdr_order,
-            };
-            drop(state);
-            self.persist_backend(persisted).await;
-            self.publish().await;
-            return action_ok(&command.request_id, "agent_order_updated");
+        if state.backend == AgentBackend::T3code {
+            state.t3code_order = mode;
+        } else {
+            state.herdr_order = mode;
         }
-        drop(state);
-        let descriptors = match self.herdr.discover().await {
-            Ok(descriptors) if !descriptors.is_empty() => descriptors,
-            Ok(_) => {
-                return action_error(
-                    &command.request_id,
-                    "session_disconnected",
-                    "no running Herdr session can change agent ordering",
-                );
-            }
-            Err(error) => {
-                tracing::warn!(%error, "Herdr discovery failed for agent ordering");
-                return action_error(
-                    &command.request_id,
-                    "session_disconnected",
-                    "Herdr agent ordering is unavailable",
-                );
-            }
-        };
-
-        let mut prior_modes = Vec::with_capacity(descriptors.len());
-        for descriptor in &descriptors {
-            match self.herdr.get_agent_order(descriptor).await {
-                Ok(prior) => prior_modes.push((descriptor.clone(), prior)),
-                Err(error) => {
-                    tracing::warn!(session = %descriptor.name, %error, "Herdr agent ordering preflight failed");
-                    let _ = self.invalidations.try_send(descriptor.name.clone());
-                    return action_error(
-                        &command.request_id,
-                        "target_unavailable",
-                        "Herdr could not verify agent ordering",
-                    );
-                }
-            }
-        }
-        if prior_modes
-            .iter()
-            .any(|(_, prior)| *prior != authoritative.mode)
-        {
-            for (descriptor, _) in &prior_modes {
-                let _ = self.invalidations.try_send(descriptor.name.clone());
-            }
-            return action_error(
-                &command.request_id,
-                "stale_snapshot",
-                "Herdr ordering changed before the action",
-            );
-        }
-
-        let mut attempted = Vec::new();
-        for (descriptor, prior) in &prior_modes {
-            if *prior == mode {
-                continue;
-            }
-            // A failed response is ambiguous: Herdr may have persisted the
-            // idempotent SET before the socket closed. Compensate every
-            // attempted descriptor, including the one returning the error.
-            attempted.push((descriptor.clone(), *prior));
-            if let Err(error) = self.herdr.set_agent_order(descriptor, mode).await {
-                tracing::warn!(session = %descriptor.name, %error, "Herdr agent ordering failed");
-                let mut compensated = true;
-                for (changed_descriptor, changed_prior) in attempted.iter().rev() {
-                    if let Err(compensation_error) = self
-                        .herdr
-                        .set_agent_order(changed_descriptor, *changed_prior)
-                        .await
-                    {
-                        compensated = false;
-                        tracing::error!(
-                            session = %changed_descriptor.name,
-                            %compensation_error,
-                            "Herdr agent ordering compensation failed"
-                        );
-                    }
-                }
-                for (checked_descriptor, checked_prior) in &prior_modes {
-                    match self.herdr.get_agent_order(checked_descriptor).await {
-                        Ok(actual) if actual == *checked_prior => {}
-                        Ok(actual) => {
-                            compensated = false;
-                            tracing::error!(
-                                session = %checked_descriptor.name,
-                                ?actual,
-                                expected = ?checked_prior,
-                                "Herdr ordering differs after compensation"
-                            );
-                        }
-                        Err(check_error) => {
-                            compensated = false;
-                            tracing::error!(
-                                session = %checked_descriptor.name,
-                                %check_error,
-                                "Herdr ordering compensation could not be verified"
-                            );
-                        }
-                    }
-                    let _ = self.invalidations.try_send(checked_descriptor.name.clone());
-                }
-                if !compensated {
-                    let mut state = self.state.write().await;
-                    state.snapshot.agent_order = AgentOrderSnapshot::default();
-                    state.snapshot.sequence = state.snapshot.sequence.saturating_add(1);
-                    state.snapshot.generated_at_ms = now_ms();
-                    drop(state);
-                    self.publish().await;
-                }
-                return action_error(
-                    &command.request_id,
-                    "target_unavailable",
-                    "Herdr could not synchronize agent ordering",
-                );
-            }
-        }
-
-        let mut state = self.state.write().await;
         state.snapshot.agent_order = AgentOrderSnapshot {
             available: true,
             mode,
@@ -1595,11 +1400,14 @@ impl DaemonRuntime {
         apply_agent_order(&mut state.snapshot.agents, &ordering);
         state.snapshot.sequence = state.snapshot.sequence.saturating_add(1);
         state.snapshot.generated_at_ms = now_ms();
+        let persisted = PersistedBackend {
+            backend: state.backend,
+            t3code_order: state.t3code_order,
+            herdr_order: state.herdr_order,
+        };
         drop(state);
+        self.persist_backend(persisted).await;
         self.publish().await;
-        for descriptor in &descriptors {
-            let _ = self.invalidations.try_send(descriptor.name.clone());
-        }
         action_ok(&command.request_id, "agent_order_updated")
     }
 
@@ -1631,7 +1439,6 @@ impl DaemonRuntime {
         state.snapshot.sessions.clear();
         state.snapshot.agents.clear();
         state.snapshot.agent_order = AgentOrderSnapshot::default();
-        state.herdr_order_daemon_owned = false;
         state.snapshot.connection = ConnectionState::Reconnecting;
         state.snapshot.backend = AgentBackendSnapshot {
             mode,
@@ -1872,24 +1679,18 @@ async fn update_subscription(
     subscriptions: &mut HashMap<String, Subscription>,
     herdr: &HerdrClient,
     descriptor: &SessionDescriptor,
-    mut pane_ids: Vec<String>,
     invalidations: mpsc::Sender<String>,
 ) -> Result<bool> {
-    pane_ids.sort();
-    pane_ids.dedup();
     if subscriptions
         .get(&descriptor.name)
-        .is_some_and(|subscription| {
-            subscription.pane_ids == pane_ids && !subscription.handle.is_finished()
-        })
+        .is_some_and(|subscription| !subscription.handle.is_finished())
     {
         return Ok(false);
     }
     if let Some(previous) = subscriptions.remove(&descriptor.name) {
         previous.handle.abort();
     }
-    let (handle, ready) =
-        herdr.spawn_subscription(descriptor.clone(), pane_ids.clone(), invalidations);
+    let (handle, ready) = herdr.spawn_subscription(descriptor.clone(), invalidations);
     match tokio::time::timeout(Duration::from_secs(3), ready).await {
         Ok(Ok(Ok(()))) => {}
         Ok(Ok(Err(message))) => {
@@ -1905,8 +1706,23 @@ async fn update_subscription(
             bail!("timed out establishing Herdr subscription");
         }
     }
-    subscriptions.insert(descriptor.name.clone(), Subscription { pane_ids, handle });
+    subscriptions.insert(descriptor.name.clone(), Subscription { handle });
     Ok(true)
+}
+
+/// The Herdr manager's sockets. A missing user environment only leaves the
+/// Herdr manager offline; the daemon and T3 Code mode still run.
+fn herdr_client(config: &Config) -> HerdrClient {
+    let resolve = |path: Result<PathBuf>, name: &str| {
+        path.unwrap_or_else(|error| {
+            tracing::warn!(%error, "{name} is unknown; the Herdr manager stays offline");
+            PathBuf::new()
+        })
+    };
+    HerdrClient::new(
+        resolve(config.herdr.core_socket(), "herdr-core socket"),
+        resolve(config.herdr.app_socket(), "Herdr app socket"),
+    )
 }
 
 fn bind_socket(path: &Path) -> Result<UnixListener> {
@@ -2004,6 +1820,7 @@ mod tests {
     use std::os::unix::{fs::PermissionsExt, net::UnixListener as StdUnixListener};
 
     use super::*;
+    use crate::config::HerdrConfig;
     use crate::model::AgentView;
     use crate::voice::VoiceController;
 
@@ -2069,12 +1886,15 @@ mod tests {
     #[tokio::test]
     async fn discovery_failure_clears_stale_ordering_and_restores_fallback_sort() {
         let temp = tempfile::tempdir().unwrap();
-        let binary = temp.path().join("herdr");
-        fs::write(&binary, "#!/bin/sh\nexit 1\n").unwrap();
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        // A socket path under a regular file cannot be inspected at all.
+        let file = temp.path().join("file");
+        fs::write(&file, "").unwrap();
         let (runtime, _) = DaemonRuntime::new(Config {
-            herdr_bin: binary,
-            ..Config::default()
+            herdr: HerdrConfig {
+                core_socket: Some(file.join("core.sock")),
+                ..test_config().herdr
+            },
+            ..test_config()
         })
         .unwrap();
         {
@@ -2101,315 +1921,6 @@ mod tests {
         assert_eq!(state.snapshot.connection, ConnectionState::Offline);
         assert!(!state.snapshot.agent_order.available);
         assert_eq!(state.snapshot.agents[0].id, "attention-first");
-    }
-
-    #[tokio::test]
-    async fn order_command_updates_herdr_and_the_published_card_order_once() {
-        let temp = tempfile::tempdir().unwrap();
-        let socket = temp.path().join("herdr.sock");
-        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let (read, mut write) = stream.into_split();
-            let mut lines = BufReader::new(read).lines();
-            let request: serde_json::Value =
-                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
-            assert_eq!(request["method"], "agent.order.get");
-            write
-                .write_all(b"{\"result\":{\"type\":\"agent_order\",\"order\":\"grouped\"}}\n")
-                .await
-                .unwrap();
-
-            let (stream, _) = listener.accept().await.unwrap();
-            let (read, mut write) = stream.into_split();
-            let mut lines = BufReader::new(read).lines();
-            let request: serde_json::Value =
-                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
-            assert_eq!(request["method"], "agent.order.set");
-            assert_eq!(request["params"], serde_json::json!({"order": "priority"}));
-            write
-                .write_all(b"{\"result\":{\"type\":\"agent_order\",\"order\":\"priority\"}}\n")
-                .await
-                .unwrap();
-        });
-        let binary = temp.path().join("herdr");
-        let session_list = serde_json::json!({
-            "sessions": [{
-                "name": "default",
-                "running": true,
-                "socket_path": socket
-            }]
-        });
-        fs::write(
-            &binary,
-            format!("#!/bin/sh\nprintf '%s\\n' '{}'\n", session_list),
-        )
-        .unwrap();
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
-        let config = Config {
-            herdr_bin: binary,
-            ..Config::default()
-        };
-        let (runtime, _) = DaemonRuntime::new(config).unwrap();
-        {
-            let mut state = runtime.state.write().await;
-            state.snapshot.sequence = 7;
-            state.snapshot.agent_order = AgentOrderSnapshot {
-                available: true,
-                mode: AgentOrderMode::Grouped,
-            };
-            state.snapshot.agents = vec![
-                AgentView {
-                    source_order: 0,
-                    ..test_agent("workspace-first", AgentStatus::Idle, false)
-                },
-                AgentView {
-                    source_order: 1,
-                    ..test_agent("attention-first", AgentStatus::Blocked, false)
-                },
-            ];
-        }
-        let result = runtime
-            .process_agent_order_command(&PortalCommand {
-                schema_version: SCHEMA_VERSION,
-                request_id: "order".into(),
-                sequence: 7,
-                agent_id: None,
-                action: ActionKind::OrderPriority,
-                capability_id: None,
-                app_id: None,
-                item_id: None,
-            })
-            .await;
-
-        assert!(result.ok);
-        let state = runtime.state.read().await;
-        assert!(state.snapshot.agent_order.available);
-        assert_eq!(state.snapshot.agent_order.mode, AgentOrderMode::Priority);
-        assert_eq!(state.snapshot.agents[0].id, "attention-first");
-        assert_eq!(state.snapshot.sequence, 8);
-        drop(state);
-        server.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn order_command_compensates_a_partial_multi_session_failure() {
-        let temp = tempfile::tempdir().unwrap();
-        let first_socket = temp.path().join("first.sock");
-        let second_socket = temp.path().join("second.sock");
-        let first_listener = tokio::net::UnixListener::bind(&first_socket).unwrap();
-        let second_listener = tokio::net::UnixListener::bind(&second_socket).unwrap();
-
-        let first = tokio::spawn(async move {
-            for (method, order, response) in [
-                (
-                    "agent.order.get",
-                    None,
-                    "{\"result\":{\"type\":\"agent_order\",\"order\":\"grouped\"}}\n",
-                ),
-                (
-                    "agent.order.set",
-                    Some("priority"),
-                    "{\"result\":{\"type\":\"agent_order\",\"order\":\"priority\"}}\n",
-                ),
-                (
-                    "agent.order.set",
-                    Some("grouped"),
-                    "{\"result\":{\"type\":\"agent_order\",\"order\":\"grouped\"}}\n",
-                ),
-                (
-                    "agent.order.get",
-                    None,
-                    "{\"result\":{\"type\":\"agent_order\",\"order\":\"grouped\"}}\n",
-                ),
-            ] {
-                let (stream, _) = first_listener.accept().await.unwrap();
-                let (read, mut write) = stream.into_split();
-                let mut lines = BufReader::new(read).lines();
-                let request: serde_json::Value =
-                    serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
-                assert_eq!(request["method"], method);
-                if let Some(order) = order {
-                    assert_eq!(request["params"]["order"], order);
-                }
-                write.write_all(response.as_bytes()).await.unwrap();
-            }
-        });
-        let second = tokio::spawn(async move {
-            for (method, order, response) in [
-                (
-                    "agent.order.get",
-                    None,
-                    "{\"result\":{\"type\":\"agent_order\",\"order\":\"grouped\"}}\n",
-                ),
-                ("agent.order.set", Some("priority"), ""),
-                (
-                    "agent.order.set",
-                    Some("grouped"),
-                    "{\"result\":{\"type\":\"agent_order\",\"order\":\"grouped\"}}\n",
-                ),
-                (
-                    "agent.order.get",
-                    None,
-                    "{\"result\":{\"type\":\"agent_order\",\"order\":\"grouped\"}}\n",
-                ),
-            ] {
-                let (stream, _) = second_listener.accept().await.unwrap();
-                let (read, mut write) = stream.into_split();
-                let mut lines = BufReader::new(read).lines();
-                let request: serde_json::Value =
-                    serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
-                assert_eq!(request["method"], method);
-                if let Some(order) = order {
-                    assert_eq!(request["params"]["order"], order);
-                }
-                write.write_all(response.as_bytes()).await.unwrap();
-            }
-        });
-
-        let binary = temp.path().join("herdr");
-        let session_list = serde_json::json!({
-            "sessions": [
-                {"name": "first", "running": true, "socket_path": first_socket},
-                {"name": "second", "running": true, "socket_path": second_socket}
-            ]
-        });
-        fs::write(
-            &binary,
-            format!("#!/bin/sh\nprintf '%s\\n' '{}'\n", session_list),
-        )
-        .unwrap();
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
-        let (runtime, _) = DaemonRuntime::new(Config {
-            herdr_bin: binary,
-            ..Config::default()
-        })
-        .unwrap();
-        {
-            let mut state = runtime.state.write().await;
-            state.snapshot.sequence = 7;
-            state.snapshot.agent_order = AgentOrderSnapshot {
-                available: true,
-                mode: AgentOrderMode::Grouped,
-            };
-        }
-
-        let result = runtime
-            .process_agent_order_command(&PortalCommand {
-                schema_version: SCHEMA_VERSION,
-                request_id: "order-partial".into(),
-                sequence: 7,
-                agent_id: None,
-                action: ActionKind::OrderPriority,
-                capability_id: None,
-                app_id: None,
-                item_id: None,
-            })
-            .await;
-
-        assert!(!result.ok);
-        assert_eq!(result.code, "target_unavailable");
-        let state = runtime.state.read().await;
-        assert_eq!(state.snapshot.sequence, 7);
-        assert_eq!(state.snapshot.agent_order.mode, AgentOrderMode::Grouped);
-        assert!(state.snapshot.agent_order.available);
-        drop(state);
-        first.await.unwrap();
-        second.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn concurrent_order_commands_serialize_and_recheck_sequence() {
-        let temp = tempfile::tempdir().unwrap();
-        let socket = temp.path().join("herdr.sock");
-        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
-        let (preflight_started_tx, preflight_started_rx) = tokio::sync::oneshot::channel();
-        let (release_preflight_tx, release_preflight_rx) = tokio::sync::oneshot::channel();
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let (read, mut write) = stream.into_split();
-            let mut lines = BufReader::new(read).lines();
-            let request: serde_json::Value =
-                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
-            assert_eq!(request["method"], "agent.order.get");
-            preflight_started_tx.send(()).unwrap();
-            release_preflight_rx.await.unwrap();
-            write
-                .write_all(b"{\"result\":{\"type\":\"agent_order\",\"order\":\"grouped\"}}\n")
-                .await
-                .unwrap();
-
-            let (stream, _) = listener.accept().await.unwrap();
-            let (read, mut write) = stream.into_split();
-            let mut lines = BufReader::new(read).lines();
-            let request: serde_json::Value =
-                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
-            assert_eq!(request["method"], "agent.order.set");
-            write
-                .write_all(b"{\"result\":{\"type\":\"agent_order\",\"order\":\"priority\"}}\n")
-                .await
-                .unwrap();
-        });
-        let binary = temp.path().join("herdr");
-        let session_list = serde_json::json!({
-            "sessions": [{"name": "default", "running": true, "socket_path": socket}]
-        });
-        fs::write(
-            &binary,
-            format!("#!/bin/sh\nprintf '%s\\n' '{}'\n", session_list),
-        )
-        .unwrap();
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
-        let (runtime, _) = DaemonRuntime::new(Config {
-            herdr_bin: binary,
-            ..Config::default()
-        })
-        .unwrap();
-        {
-            let mut state = runtime.state.write().await;
-            state.snapshot.sequence = 7;
-            state.snapshot.agent_order = AgentOrderSnapshot {
-                available: true,
-                mode: AgentOrderMode::Grouped,
-            };
-        }
-        let command = PortalCommand {
-            schema_version: SCHEMA_VERSION,
-            request_id: "first".into(),
-            sequence: 7,
-            agent_id: None,
-            action: ActionKind::OrderPriority,
-            capability_id: None,
-            app_id: None,
-            item_id: None,
-        };
-        let first_runtime = runtime.clone();
-        let first =
-            tokio::spawn(async move { first_runtime.process_agent_order_command(&command).await });
-        preflight_started_rx.await.unwrap();
-        let second_runtime = runtime.clone();
-        let second = tokio::spawn(async move {
-            second_runtime
-                .process_agent_order_command(&PortalCommand {
-                    schema_version: SCHEMA_VERSION,
-                    request_id: "second".into(),
-                    sequence: 7,
-                    agent_id: None,
-                    action: ActionKind::OrderPriority,
-                    capability_id: None,
-                    app_id: None,
-                    item_id: None,
-                })
-                .await
-        });
-        release_preflight_tx.send(()).unwrap();
-
-        assert!(first.await.unwrap().ok);
-        let second = second.await.unwrap();
-        assert!(!second.ok);
-        assert_eq!(second.code, "stale_snapshot");
-        assert_eq!(runtime.state.read().await.snapshot.sequence, 8);
-        server.await.unwrap();
     }
 
     #[test]
@@ -2478,7 +1989,7 @@ mod tests {
 
     #[tokio::test]
     async fn successful_portal_open_acknowledges_review_ready() {
-        let (runtime, _) = DaemonRuntime::new(Config::default()).unwrap();
+        let (runtime, _) = DaemonRuntime::new(test_config()).unwrap();
         let agent = test_agent("agent", AgentStatus::Idle, false);
         {
             let mut state = runtime.state.write().await;
@@ -2517,7 +2028,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let state_path = temp.path().join("voice-state");
         fs::write(&state_path, "recording").unwrap();
-        let (mut runtime, _) = DaemonRuntime::new(Config::default()).unwrap();
+        let (mut runtime, _) = DaemonRuntime::new(test_config()).unwrap();
         runtime.voice = Arc::new(Mutex::new(VoiceController::new(
             temp.path().join("voxtype"),
             state_path,
@@ -2554,7 +2065,7 @@ mod tests {
         .unwrap();
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
 
-        let (mut runtime, _) = DaemonRuntime::new(Config::default()).unwrap();
+        let (mut runtime, _) = DaemonRuntime::new(test_config()).unwrap();
         runtime.voice = Arc::new(Mutex::new(VoiceController::new(
             binary,
             state_path,
@@ -2612,14 +2123,24 @@ mod tests {
         }
     }
 
-    fn test_target(pane_id: &str, state_change_seq: u64) -> AgentTarget {
+    /// A configuration that can never reach the user's own herdr-core or
+    /// Herdr app.
+    fn test_config() -> Config {
+        Config {
+            herdr: HerdrConfig {
+                core_socket: Some(PathBuf::from("/nonexistent/xeneon-test/herdr-core.sock")),
+                app_socket: Some(PathBuf::from("/nonexistent/xeneon-test/herdr-app.sock")),
+            },
+            ..Config::default()
+        }
+    }
+
+    fn test_target(terminal: &str, state_change_seq: u64) -> AgentTarget {
         AgentTarget::Herdr(HerdrTarget {
             session: "default".into(),
-            socket_path: PathBuf::from("/tmp/herdr.sock"),
-            pane_id: pane_id.into(),
-            terminal_id: "terminal".into(),
+            app_socket: PathBuf::from("/nonexistent/xeneon-test/herdr-app.sock"),
+            terminal: terminal.into(),
             state_change_seq,
-            revision: 1,
         })
     }
 
@@ -2646,7 +2167,7 @@ mod tests {
 
     #[tokio::test]
     async fn desktop_apps_are_published_and_unknown_ids_are_refused() {
-        let (runtime, _) = DaemonRuntime::new(Config::default()).unwrap();
+        let (runtime, _) = DaemonRuntime::new(test_config()).unwrap();
         let published: Vec<_> = runtime
             .state
             .read()
@@ -2705,8 +2226,7 @@ mod tests {
             .path()
             .join("state/xeneon-edge-agents/agent-backend.toml");
         let (runtime, mut invalidations) =
-            DaemonRuntime::new_with_state_path(Config::default(), Some(state_path.clone()))
-                .unwrap();
+            DaemonRuntime::new_with_state_path(test_config(), Some(state_path.clone())).unwrap();
         {
             let mut state = runtime.state.write().await;
             state.snapshot.sequence = 4;
@@ -2763,7 +2283,7 @@ mod tests {
         assert_eq!(runtime.state.read().await.snapshot.sequence, 5);
 
         let (restored, _) =
-            DaemonRuntime::new_with_state_path(Config::default(), Some(state_path)).unwrap();
+            DaemonRuntime::new_with_state_path(test_config(), Some(state_path)).unwrap();
         assert_eq!(restored.state.read().await.backend, AgentBackend::T3code);
         assert_eq!(
             restored.state.read().await.snapshot.backend.mode,
@@ -2773,14 +2293,9 @@ mod tests {
 
     #[tokio::test]
     async fn t3code_ordering_is_daemon_owned_and_never_calls_herdr() {
-        let temp = tempfile::tempdir().unwrap();
-        let binary = temp.path().join("herdr");
-        fs::write(&binary, "#!/bin/sh\nexit 1\n").unwrap();
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
         let (runtime, _) = DaemonRuntime::new(Config {
-            herdr_bin: binary,
             agent_backend: AgentBackend::T3code,
-            ..Config::default()
+            ..test_config()
         })
         .unwrap();
         {
@@ -2825,20 +2340,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stock_herdr_ordering_is_daemon_owned_and_never_calls_herdr() {
-        let temp = tempfile::tempdir().unwrap();
-        let binary = temp.path().join("herdr");
-        fs::write(&binary, "#!/bin/sh\nexit 1\n").unwrap();
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+    async fn herdr_ordering_is_daemon_owned_and_never_calls_herdr() {
         let (runtime, _) = DaemonRuntime::new(Config {
-            herdr_bin: binary,
             agent_backend: AgentBackend::Herdr,
-            ..Config::default()
+            ..test_config()
         })
         .unwrap();
         {
             let mut state = runtime.state.write().await;
-            state.herdr_order_daemon_owned = true;
             state.snapshot.sequence = 7;
             state.snapshot.agent_order = AgentOrderSnapshot {
                 available: true,
@@ -2882,7 +2391,7 @@ mod tests {
     async fn t3code_agent_actions_never_reach_herdr_or_launch_applications() {
         let (runtime, _) = DaemonRuntime::new(Config {
             agent_backend: AgentBackend::T3code,
-            ..Config::default()
+            ..test_config()
         })
         .unwrap();
         {
@@ -2929,18 +2438,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn herdr_agents_offer_only_focus() {
+        let (runtime, _) = DaemonRuntime::new(test_config()).unwrap();
+        {
+            let mut state = runtime.state.write().await;
+            state.snapshot.sequence = 3;
+            let mut agent = test_agent("agent", AgentStatus::Blocked, false);
+            agent.actions = AgentActions {
+                open: true,
+                zoom: true,
+                approve: None,
+                interrupt: None,
+            };
+            state.snapshot.agents = vec![agent];
+            state.targets.insert("agent".into(), test_target("t1", 1));
+        }
+        let command = PortalCommand {
+            schema_version: SCHEMA_VERSION,
+            request_id: "zoom".into(),
+            sequence: 3,
+            agent_id: Some("agent".into()),
+            action: ActionKind::Zoom,
+            capability_id: None,
+            app_id: None,
+            item_id: None,
+        };
+        let zoom = runtime
+            .process_command(&serde_json::to_string(&command).unwrap(), Uuid::new_v4())
+            .await;
+        assert!(!zoom.ok);
+        assert_eq!(zoom.code, "target_unavailable");
+
+        // With the Herdr app unreachable, focus fails without touching the
+        // compositor and reports the agent as unavailable.
+        let open = runtime
+            .process_command(
+                &serde_json::to_string(&PortalCommand {
+                    request_id: "open".into(),
+                    action: ActionKind::Open,
+                    ..command
+                })
+                .unwrap(),
+                Uuid::new_v4(),
+            )
+            .await;
+        assert!(!open.ok);
+        assert_eq!(open.code, "target_unavailable");
+    }
+
+    #[tokio::test]
     async fn refresh_agents_releases_state_locks_before_dispatching() {
         let temp = tempfile::tempdir().unwrap();
-        let binary = temp.path().join("herdr");
-        fs::write(&binary, "#!/bin/sh\nexit 1\n").unwrap();
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
         let (runtime, _) = DaemonRuntime::new(Config {
-            herdr_bin: binary,
             t3code: crate::config::T3codeConfig {
                 home: Some(temp.path().join("t3")),
                 ..crate::config::T3codeConfig::default()
             },
-            ..Config::default()
+            ..test_config()
         })
         .unwrap();
 
@@ -2973,27 +2527,20 @@ mod tests {
     #[tokio::test]
     async fn late_herdr_refresh_never_commits_over_a_t3code_roster() {
         let temp = tempfile::tempdir().unwrap();
-        let socket = temp.path().join("herdr.sock");
+        let socket = temp.path().join("core.sock");
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
         let server = tokio::spawn(async move {
-            // Any Herdr request after the switch is a contract violation.
+            // Any herdr-core request after the switch is a contract violation.
             tokio::time::timeout(Duration::from_millis(500), listener.accept())
                 .await
                 .is_ok()
         });
-        let binary = temp.path().join("herdr");
-        let session_list = serde_json::json!({
-            "sessions": [{"name": "default", "running": true, "socket_path": socket}]
-        });
-        fs::write(
-            &binary,
-            format!("#!/bin/sh\nprintf '%s\\n' '{}'\n", session_list),
-        )
-        .unwrap();
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
         let (runtime, _) = DaemonRuntime::new(Config {
-            herdr_bin: binary,
-            ..Config::default()
+            herdr: HerdrConfig {
+                core_socket: Some(socket),
+                ..test_config().herdr
+            },
+            ..test_config()
         })
         .unwrap();
         {

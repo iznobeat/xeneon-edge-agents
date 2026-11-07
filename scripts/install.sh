@@ -403,8 +403,6 @@ if ((apply_production && !isolated_root)); then
     die "production commissioning requires quickshell on the service PATH"
   command -v hyprctl >/dev/null 2>&1 ||
     die "production commissioning requires a running Hyprland session"
-  PATH="$bin_home:/usr/local/bin:/usr/bin" command -v herdr >/dev/null 2>&1 ||
-    die "production commissioning requires herdr on the service PATH"
 
   preflight_root=$temp_dir/live-hardware-preflight
   mkdir -p "$preflight_root/.config/hypr" "$preflight_root/.local/bin"

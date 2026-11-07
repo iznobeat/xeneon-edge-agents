@@ -32,8 +32,10 @@ active; Quickshell is presentation-only.
   output-filtered `PanelWindow` delegates.
 - Hyprland: one project-owned Lua module loaded after the user's monitor/input
   modules. `hyprmoncfg` continues to own `monitors.lua`.
-- Herdr changes live in its own repository and must use the public socket/API
-  boundary.
+- Herdr mode reads herdr-core only through its documented JSON-RPC socket
+  (`hc schema`) and reaches the Herdr app only through its typed `agent.focus`
+  command; it never starts a core and offers no zoom, approve, or interrupt
+  actions. Changes to Herdr itself live in its own repository.
 - T3 Code has no public local thread-focus API on Linux; T3 mode activates only
   its exact desktop window and offers no zoom, approve, or interrupt actions.
 

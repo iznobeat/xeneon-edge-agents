@@ -17,7 +17,6 @@ pub struct Config {
     /// Agent manager observed at startup unless a persisted portal choice
     /// overrides it. The portal can switch between `herdr` and `t3code`.
     pub agent_backend: AgentBackend,
-    pub herdr_bin: PathBuf,
     pub voxtype_bin: PathBuf,
     pub herdr_refresh_ms: u64,
     pub health_refresh_ms: u64,
@@ -35,6 +34,60 @@ pub struct Config {
     pub github: GithubConfig,
     pub game: GameConfig,
     pub t3code: T3codeConfig,
+    pub herdr: HerdrConfig,
+}
+
+/// Where the Herdr manager reads herdr-core and reaches the Herdr app. Both
+/// default to the locations those programs use for the current user.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HerdrConfig {
+    /// herdr-core's JSON-RPC socket. Defaults to
+    /// `$XDG_RUNTIME_DIR/herdr-core/$HC_SESSION.sock` (session `default`).
+    pub core_socket: Option<PathBuf>,
+    /// The Herdr app's command socket. Defaults to
+    /// `$HERDR_APP_HOME/herdr-app.sock`, then
+    /// `$XDG_CONFIG_HOME/herdr-app/herdr-app.sock`.
+    pub app_socket: Option<PathBuf>,
+}
+
+impl HerdrConfig {
+    pub fn core_socket(&self) -> Result<PathBuf> {
+        if let Some(path) = &self.core_socket {
+            return Ok(path.clone());
+        }
+        let runtime = env::var_os("XDG_RUNTIME_DIR")
+            .filter(|value| !value.is_empty())
+            .context("XDG_RUNTIME_DIR is not set; set herdr.core_socket")?;
+        let session = env::var("HC_SESSION")
+            .ok()
+            .filter(|session| is_session_name(session))
+            .unwrap_or_else(|| "default".to_owned());
+        Ok(PathBuf::from(runtime)
+            .join("herdr-core")
+            .join(format!("{session}.sock")))
+    }
+
+    pub fn app_socket(&self) -> Result<PathBuf> {
+        if let Some(path) = &self.app_socket {
+            return Ok(path.clone());
+        }
+        if let Some(home) = env::var_os("HERDR_APP_HOME").filter(|value| !value.is_empty()) {
+            return Ok(PathBuf::from(home).join("herdr-app.sock"));
+        }
+        config_home()
+            .map(|root| root.join("herdr-app/herdr-app.sock"))
+            .context("neither XDG_CONFIG_HOME nor HOME is set; set herdr.app_socket")
+    }
+}
+
+fn is_session_name(session: &str) -> bool {
+    !session.is_empty()
+        && session.len() <= 64
+        && session
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
+        && !session.starts_with('.')
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -332,7 +385,6 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             agent_backend: AgentBackend::Herdr,
-            herdr_bin: PathBuf::from("herdr"),
             voxtype_bin: PathBuf::from("voxtype"),
             herdr_refresh_ms: 5_000,
             health_refresh_ms: 1_000,
@@ -348,6 +400,7 @@ impl Default for Config {
             github: GithubConfig::default(),
             game: GameConfig::default(),
             t3code: T3codeConfig::default(),
+            herdr: HerdrConfig::default(),
         }
     }
 }
@@ -356,7 +409,7 @@ impl Default for DesktopConfig {
     fn default() -> Self {
         Self {
             edge_output: None,
-            herdr_class: "herdr".into(),
+            herdr_class: "herdr-app".into(),
             apps: default_desktop_apps(),
         }
     }
@@ -490,8 +543,13 @@ impl Config {
         {
             anyhow::bail!("desktop.edge_output must match screen.connector");
         }
-        if self.herdr_bin.as_os_str().is_empty() {
-            anyhow::bail!("herdr_bin must not be empty");
+        for (name, path) in [
+            ("herdr.core_socket", &self.herdr.core_socket),
+            ("herdr.app_socket", &self.herdr.app_socket),
+        ] {
+            if path.as_ref().is_some_and(|path| !path.is_absolute()) {
+                anyhow::bail!("{name} must be an absolute path");
+            }
         }
         if self.voxtype_bin.as_os_str().is_empty() {
             anyhow::bail!("voxtype_bin must not be empty");
@@ -667,6 +725,32 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("commissioned screen identity"));
+    }
+
+    #[test]
+    fn herdr_section_names_absolute_sockets_and_ignores_the_old_binary() {
+        let parsed: Config = toml::from_str(
+            "herdr_bin = \"herdr\"\n[herdr]\ncore_socket = \"/run/user/1/herdr-core/work.sock\"\napp_socket = \"/home/u/.config/herdr-app/herdr-app.sock\"\n",
+        )
+        .unwrap();
+        parsed.validate().unwrap();
+        assert_eq!(
+            parsed.herdr.core_socket().unwrap(),
+            Path::new("/run/user/1/herdr-core/work.sock")
+        );
+        assert_eq!(
+            parsed.herdr.app_socket().unwrap(),
+            Path::new("/home/u/.config/herdr-app/herdr-app.sock")
+        );
+        assert_eq!(parsed.desktop.herdr_class, "herdr-app");
+
+        let relative: Config = toml::from_str("[herdr]\ncore_socket = \"core.sock\"\n").unwrap();
+        assert!(relative.validate().is_err());
+        assert!(toml::from_str::<Config>("[herdr]\nbinary = \"hc\"\n").is_err());
+        assert!(is_session_name("default"));
+        for unsafe_name in ["", "../x", ".hidden", "a/b"] {
+            assert!(!is_session_name(unsafe_name), "{unsafe_name}");
+        }
     }
 
     #[test]

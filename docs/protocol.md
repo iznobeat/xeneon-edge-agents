@@ -96,16 +96,15 @@ Connection and action failures are separate fields, not invented agent states.
 Unavailable health metrics use `available: false` and omit `value`; they are
 never encoded as a false zero.
 
-The Herdr adapter accepts protocol 20 from the Omarchy Herdr v0.8.0.r13 base
-and protocol 22 from stock Herdr v0.9.1. Stock protocol 22 serves the same
-snapshot, subscription, `agent.focus`, and `pane.zoom` shapes but none of the
-fork-only `agent.order.*` or `agent.perform_action` methods, so ordering is
-unavailable and no approve or interrupt capability is ever surfaced. Protocol
-21 is rejected because upstream and the XENEON fork both report it.
-Any other value from `ping` produces
-an `incompatible` session with no agents, targets, actions, snapshot request,
-or event subscription; the daemon does not guess compatibility across a Herdr
-protocol boundary.
+The Herdr adapter reads herdr-core, the terminal runtime behind the Herdr app,
+over its documented JSON-RPC socket (protocol generation 1). A Herdr roster
+uses one session named after the core socket (normally `default`) whose
+`version` is herdr-core's version and whose `protocol` is omitted. Herdr cards
+have `open: true`, `zoom: false`, and no capabilities, because herdr-core has
+no zoom or guarded actions. `focused` marks the terminal in the Herdr app's
+focused pane while the app runs. A herdr-core reply that no longer matches the
+documented terminal schema makes that refresh fail, and the session goes
+`stale` with its actions removed, rather than guessing.
 
 `action_result` acknowledges one command:
 
@@ -140,8 +139,10 @@ Stable failure codes include `invalid_command`, `stale_snapshot`,
 
 The only actions are:
 
-- `open`: focus the fresh agent target and activate its exact Herdr client.
-- `zoom`: toggle the fresh pane's Herdr zoom state.
+- `open`: show the fresh agent target in its manager and activate that
+  manager's exact window.
+- `zoom`: reserved; no supported manager offers it, so cards carry
+  `zoom: false` and the daemon refuses it.
 - `approve` and `interrupt`: require the capability ID present in the same
   current snapshot. The daemon forwards only that opaque ID.
 - `restore_focus`: takes no agent or capability and restores a previously
@@ -181,18 +182,19 @@ The only actions are:
   compositor client with that entry's class, or launches its desktop entry
   when none exists. An id that is not configured is refused. `app_id` is
   rejected on every other action.
-- `order_grouped` and `order_priority`: take no agent or capability and apply
-  one typed, idempotent ordering value through Herdr's public API. Stock
-  Herdr protocol 22 has no ordering API, so for an all-stock roster the daemon
-  owns the value and persists it like T3 Code's. Otherwise the daemon
-  polls the same authoritative Herdr setting, so changes made in either UI
-  converge without a portal-owned preference. In T3 Code mode the same
-  commands set a daemon-owned preference because T3 Code has no ordering API.
+- `order_grouped` and `order_priority`: take no agent or capability and set a
+  daemon-owned ordering preference for the active manager, persisted beside
+  the manager choice. Neither herdr-core nor T3 Code has an ordering API.
 - `backend_herdr` and `backend_t3code`: take no agent or capability, are gated
   on the current snapshot `sequence`, and switch the active agent manager.
   Repeating the current manager succeeds without changing state. A switch
   clears every card, private target, latch, and subscription, publishes a
   reconnecting snapshot with the new `backend.mode`, and persists the choice.
+
+In Herdr mode `open` sends the Herdr app's typed `agent.focus` command for the
+card's terminal and activates the exact `herdr-app` window; it never launches
+the app. `zoom`, `approve`, and `interrupt` fail with `target_unavailable` or
+`capability_expired`.
 
 In T3 Code mode `open` activates the exact `t3code` desktop window and
 acknowledges the card's review badge; it never launches T3 Code or navigates

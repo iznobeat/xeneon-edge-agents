@@ -1308,11 +1308,10 @@ test_live_production_preflight_changes_nothing_when_edge_absent() {
   printf 'require("hypr.input")\n' >"$root/config/hypr/hyprland.lua"
   : >"$root/bin/xeneon-agentd"
   : >"$root/bin/xeneon-agentctl"
-  : >"$root/bin/herdr"
   : >"$root/bin/quickshell"
   : >"$root/bin/hyprctl"
   chmod +x \
-    "$root/bin/xeneon-agentd" "$root/bin/xeneon-agentctl" "$root/bin/herdr" \
+    "$root/bin/xeneon-agentd" "$root/bin/xeneon-agentctl" \
     "$root/bin/quickshell" "$root/bin/hyprctl"
   before=$(sha256sum "$root/config/hypr/hyprland.lua")
 

@@ -2,7 +2,6 @@
 # Manager control switches between them at runtime and persists the choice
 # under $XDG_STATE_HOME/xeneon-edge-agents/agent-backend.toml.
 agent_backend = "herdr"
-herdr_bin = "herdr"
 voxtype_bin = "voxtype"
 herdr_refresh_ms = 5000
 health_refresh_ms = 1000
@@ -14,6 +13,15 @@ micro_refresh_ms = 5000
 # Production commissioning writes connector, serial, model, and touch_device.
 # Their absence is intentional: the simulator-safe default identifies no EDGE.
 
+[herdr]
+# Herdr mode reads herdr-core, the terminal runtime behind the Herdr app, and
+# shows agents through the Herdr app. Both sockets default to their programs'
+# own locations: $XDG_RUNTIME_DIR/herdr-core/$HC_SESSION.sock (session
+# "default") and $HERDR_APP_HOME/herdr-app.sock, else
+# ~/.config/herdr-app/herdr-app.sock.
+# core_socket = "/run/user/1000/herdr-core/default.sock"
+# app_socket = "/home/user/.config/herdr-app/herdr-app.sock"
+
 [t3code]
 # T3 Code data directory. Defaults to $T3CODE_HOME, then ~/.t3. Only the
 # read-only state projection and server runtime descriptor are read.
@@ -21,7 +29,7 @@ micro_refresh_ms = 5000
 refresh_ms = 1000
 
 [desktop]
-herdr_class = "herdr"
+herdr_class = "herdr-app"
 # Production commissioning writes edge_output.
 
 # Launchable desktop apps (0-4) are configured per machine in desktop-apps.toml

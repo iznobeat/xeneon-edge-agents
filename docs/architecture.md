@@ -44,13 +44,40 @@ AI usage records/DB
            standalone Quickshell portal
 ```
 
-The daemon has no network listener. It discovers all running local Herdr
-sessions with `herdr session list --json`, uses one-shot public socket requests
-for reads and actions, and keeps one acknowledged event subscription per
-session. It subscribes to lifecycle, focus, and agent-state events, omitting
-high-volume pane-content, layout, and metadata updates. Related event bursts
-are coalesced for 200 ms before one authoritative reconciliation; a five-second
-reconciliation remains as the repair path.
+The daemon has no network listener. In Herdr mode it reads herdr-core, the
+terminal runtime behind the Herdr app, through that core's documented JSON-RPC
+socket (`hc schema`, protocol generation 1, default
+`$XDG_RUNTIME_DIR/herdr-core/default.sock`). Discovery only checks that the
+socket exists, so the daemon never starts a core the way the `hc` CLI would.
+Reads are one-shot `server.status` and `terminal.list` requests, and one
+acknowledged `events.subscribe` stream invalidates the roster. Title and size
+changes, which repaint many times a second while an agent works, and
+heartbeats are ignored; any other fact change, including unknown ones and a
+`missed` notice, invalidates. Related event bursts are coalesced for 200 ms
+before one authoritative reconciliation; a five-second reconciliation remains
+as the repair path.
+
+## Herdr adapter
+
+An agent is a live herdr-core terminal whose program reports an OSC 7501
+status and that the Herdr app shows: it carries the app's `herdr.space`
+label, or descends through `parent` links (bounded, cycle-safe) from one that
+does, which places sub-agents in their parent's space. `working`, `blocked`,
+`done`, and `idle` keep their meaning; `error` needs a person and maps to
+`blocked`. `status_ms` is the state-change sequence. Status messages, titles,
+argv, and screen contents can carry prompt text and are never read into the
+portal model.
+
+Card focus is the one action. The daemon sends the Herdr app's own typed
+`agent.focus` command for the exact terminal over the app's command socket
+(default `~/.config/herdr-app/herdr-app.sock`), then activates the exact
+`herdr-app` window by class and main title. herdr-core has no zoom, ordering
+preference, or guarded approve/interrupt capabilities, so zoom is not offered,
+those capabilities are never issued, and the grouped/priority Order control is
+a daemon-owned preference persisted beside the manager choice. The focused
+card is the terminal in the Herdr app's focused pane, read from the app's
+`status` and `ls` replies when the app is running; with the window closed the
+roster stays live and nothing is focused.
 
 ## Agent manager selection
 
@@ -109,19 +136,13 @@ daemon-owned preference persisted beside the manager choice.
 
 Portal agent IDs are UUIDv5 values derived from the daemon epoch, Herdr session,
 and live terminal identity, or from the daemon epoch and T3 Code thread ID.
-The current pane ID or thread ID remains private action-routing state.
+The terminal address or thread ID remains private action-routing state.
 Restarting the daemon or switching managers invalidates every ID. Herdr
-disconnects immediately remove action targets and guarded capabilities.
+disconnects immediately remove action targets.
 
-The adapter reads Herdr's durable `grouped`/`priority` agent-order mode on each
-normal reconciliation. The portal can request only those two typed values;
-the daemon applies them through `agent.order.set` and reorders the normalized
-cards from the returned authoritative state. An older Herdr without that API
-keeps agent telemetry working but exposes ordering as unavailable.
-
-Card names use Herdr's tab identity rather than terminal or prompt text. The
-daemon joins an agent's `tab_id` to the snapshot's tab label, with only
-`display_agent`, agent `name`, and canonical agent fallbacks.
+Card names never use terminal titles or prompt text. A terminal's own name
+wins, then its tab from the Herdr app's `where` label (`<space> / <tab>`)
+unless the tab is only numbered, then `<agent> · <space>`.
 
 The review-ready latch follows the Codex Micro contract. A working agent that
 becomes idle remains review-ready until a new Herdr focus transition selects it
@@ -149,9 +170,9 @@ status object with the device firmware identity; a socket or malformed response
 never proves hardware presence. QML receives only bounded battery, firmware,
 layer, and profile fields and has no method for sending Micro commands.
 
-Input actions are never queued or replayed. Focus and zoom are resolved against
-the latest private pane target. Approval and interruption require an opaque,
-single-use capability issued and revalidated by a compatible Herdr server.
+Input actions are never queued or replayed. Focus is resolved against the
+latest private terminal target. Neither agent manager issues approval or
+interruption capabilities, so the portal never offers them.
 
 ## Voice boundary
 

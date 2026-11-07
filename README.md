@@ -40,11 +40,10 @@ after reboot or replug does not weaken the hardware identity.
 - `config/` and `scripts/`: reversible user-service, exact-identity hotplug,
   and Omarchy integration.
 
-Herdr remains authoritative. The portal can never send arbitrary text, keys,
-or shell commands. Open and zoom are narrow public Herdr API calls. Interrupt
-requires a short-lived capability issued and revalidated by a compatible Herdr
-server; approval is deliberately unavailable until a current prompt can be
-grounded safely.
+The agent manager remains authoritative. The portal can never send arbitrary
+text, keys, or shell commands. Opening a Herdr card is one typed `agent.focus`
+command to the Herdr app; approve and interrupt are unavailable because no
+supported manager issues a capability that grounds them safely.
 
 For the full boundary model, see the [architecture](docs/architecture.md) and
 [protocol](docs/protocol.md) documentation.
@@ -58,9 +57,11 @@ configured `agent_backend` (default `herdr`) when nothing is persisted.
 Switching clears the previous roster, private action targets, review latches,
 and focus history before the next manager is observed.
 
-**Herdr** mode is the original contract: all running local Herdr sessions,
-event subscriptions, capability-gated approve/interrupt, zoom, and Herdr's own
-grouped/priority ordering.
+**Herdr** mode follows the Herdr app. The daemon reads herdr-core, the
+terminal runtime behind the app, over its documented local socket: every live
+agent the app shows, including sub-agents, with event-driven updates. Tapping
+a card shows that agent in the Herdr app and raises its window. herdr-core has
+no ordering preference, so the daemon keeps the grouped/priority choice.
 
 **T3 Code** mode observes the local T3 Code server without any network or
 authenticated API. The daemon reads only the bounded thread, session, turn, and
@@ -145,8 +146,8 @@ The header's right side holds a clock whose digits roll into place and whose
 hairline sweeps smoothly across each minute; the voice and Micro controls are
 not shown in this fork.
 Tapping the AGENTS tab switches ordering: arriving shows Priority, and each
-further tap flips between Grouped and Priority. With Herdr's fork the value is
-Herdr's own setting; with stock Herdr the daemon keeps it.
+further tap flips between Grouped and Priority. The daemon keeps the value for
+each manager.
 The upper-right Screen and Palette controls are shared by the command-center
 and Ambient views. Screen applies a reversible near-black portal veil. The
 saved reduce-motion preference (or the system setting) still snaps the

@@ -47,7 +47,16 @@ event-driven lifecycle. The commissioned EDID, serial/model, and USB touch
 identity remain authoritative while the current connector becomes runtime
 state; the daemon and portal run only while that exact hardware is present.
 
-The active agent-manager checkpoint adds T3 Code as a second agent manager with
+The active Herdr checkpoint follows the Herdr desktop app. Its terminals and
+agents run in herdr-core, which documents a JSON-RPC socket (`hc schema`,
+protocol generation 1). The daemon reads `server.status` and `terminal.list`
+from it, follows one `events.subscribe` stream, and never starts a core.
+Cards are live terminals with an OSC 7501 status that the app shows, including
+sub-agents. A card tap sends the app's own typed `agent.focus` command and
+raises the exact `herdr-app` window. herdr-core has no zoom, ordering, or
+guarded capabilities, so those stay daemon-owned or unavailable.
+
+The completed agent-manager checkpoint adds T3 Code as a second agent manager with
 the same card semantics as Herdr, switched from a new header Manager control.
 The daemon owns the selection, persists it under the state directory, reads
 only T3 Code's bounded read-only projections gated on its live server process,
@@ -117,6 +126,10 @@ and interrupt stay unavailable in that mode.
       writes T3 Code state or reads messages.
 - [ ] Physical EDGE touch validation of the Manager toggle and T3 Code card
       focus (software gates and a live laptop preview are complete).
+- [x] Herdr mode reads herdr-core (the Herdr app's terminal runtime) over its
+      documented JSON-RPC socket instead of the legacy Herdr session socket,
+      and card focus uses the Herdr app's typed `agent.focus` command.
+- [ ] Physical EDGE touch validation of Herdr app card focus.
 
 ## Streams
 
@@ -137,6 +150,7 @@ and interrupt stay unavailable in that mode.
 | Herdr v0.8 compatibility | `herdr-v0.8-compat` in `herdr-v0.8-compat` worktree | Herdr protocol gate, adapter fixture, protocol docs | Installed from `6edfcd3`; live handoff, protocol 19 connection, services, and production checker passed |
 | Hotplug lifecycle | `hotplug-lifecycle` in `hotplug-lifecycle` worktree | lifecycle reconciler, user units, Hyprland event hook, runtime connector override, installer/tests | Installed and independently reviewed; exact `DP-2` unplug stopped both services and replug restored the stack and touch mapping; burst and mid-settle races are covered by regression tests |
 | T3 Code agent manager | `t3code-backend` | `t3code.rs` adapter, backend dispatch and persistence in `runtime.rs`, `backend` protocol field and `backend_*` commands, header Manager toggle, manager-aware copy, `t3code.ndjson` fixture, docs/config/schema | Software complete on 2026-09-11: Rust (107 tests, clippy, fmt), QML (116 Qt tests, 28 contract tests) green; live source preview switched to T3 Code and back over the daemon socket, showed 13 real threads, focused the `t3code` window on card open, applied daemon-owned ordering, and persisted `agent-backend.toml`; a refresh-dispatch deadlock found in that live run is fixed with a regression test; independent review complete (one confirmed race, a late Herdr refresh committing over a T3 Code roster, fixed with a regression test, plus two minor findings fixed; 108 Rust tests); installed on 2026-09-11 from local merge `t3code-install` (this branch plus `herdr-protocol-21`, gate green with 112 Rust tests) via `cargo install` and `scripts/install.sh --apply-production --activate`; the installed daemon reconnected to Herdr 0.8.2 (protocol 21, 28 agents), switched to T3 Code over its socket with a live roster and a 0600 persisted `agent-backend.toml`, and switched back; physical EDGE touch validation of the toggle is the remaining gate |
+| Herdr app / herdr-core | `herdr-core-adapter` in `xeneon-edge-agents-herdr-core` worktree | `herdr.rs` rewritten for herdr-core `server.status`/`terminal.list`/`events.subscribe` and the Herdr app's `agent.focus`; `[herdr]` socket config; `herdr-app` window activation; legacy fork ordering, capability, process-tree window matching, and `herdr` PATH requirement removed; docs/config | In progress 2026-11-07: Rust gate green; live and review gates below |
 | Global display controls | `agent/portal-voice-ring` in `portal-voice-ring` worktree | persistent presentation settings, reduced-motion composition, dim veil | Live on the physical EDGE; default full-motion/normal-screen state restored |
 | Omarchy integration | `agent/portal-voice-ring` in `portal-voice-ring` worktree | `config/`, `scripts/`, services, install tests | Production user integration installed and active on the physical EDGE |
 

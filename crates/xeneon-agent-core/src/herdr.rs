@@ -1,7 +1,20 @@
+//! Herdr adapter over herdr-core, the terminal runtime behind the Herdr app.
+//!
+//! Every read uses herdr-core's documented JSON-RPC 2.0 socket (`hc schema`,
+//! protocol generation 1): `server.status`, `terminal.list`, and
+//! `events.subscribe`. Agents are live terminals whose program reports an
+//! OSC 7501 status and that belong to a Herdr app space, directly or as a
+//! sub-agent of one. The only action is focus, sent to the Herdr app's own
+//! command socket as `agent.focus`; herdr-core offers no ordering preference
+//! and no guarded approve/interrupt capabilities, so the daemon owns ordering
+//! and those actions stay unavailable.
+//!
+//! Status messages, titles, argv, and screen contents are never read into
+//! the portal model: they can carry prompt text.
+
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    process::Stdio,
     time::Duration,
 };
 
@@ -10,55 +23,43 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    net::UnixStream,
-    process::Command,
+    net::{
+        UnixStream,
+        unix::{OwnedReadHalf, OwnedWriteHalf},
+    },
     sync::{mpsc, oneshot},
     time::timeout,
 };
 use uuid::Uuid;
 
-use crate::model::{
-    ActionCapability, ActionKind, AgentActions, AgentOrderMode, AgentStatus, AgentView,
-    SessionState, SessionView,
-};
+use crate::model::{AgentActions, AgentStatus, AgentView, SessionState, SessionView};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
-// Protocol 20 is the Omarchy Herdr v0.8.0.r13 base; protocol 22 is stock
-// Herdr v0.9.1, which serves the same snapshot, subscription, focus, and zoom
-// shapes but none of the fork-only ordering or capability APIs. Protocol 21 is
-// deliberately absent: upstream and the XENEON fork both report it, so it does
-// not identify which API series the server carries.
-const SUPPORTED_HERDR_PROTOCOLS: [u32; 2] = [20, 22];
-const STOCK_HERDR_PROTOCOL: u32 = 22;
-
-fn supported_protocols_label() -> String {
-    SUPPORTED_HERDR_PROTOCOLS
-        .iter()
-        .map(u32::to_string)
-        .collect::<Vec<_>>()
-        .join(" or ")
-}
+/// Labels the Herdr app writes on the terminals it shows.
+const SPACE_LABEL: &str = "herdr.space";
+const WHERE_LABEL: &str = "where";
+/// Fact changes that cannot change a card. Titles repaint many times a
+/// second while an agent works, so they must never trigger a refresh.
+const IGNORED_EVENTS: [&str; 2] = ["title", "size"];
 
 #[derive(Debug, Clone)]
 pub struct HerdrClient {
-    binary: PathBuf,
+    core_socket: PathBuf,
+    app_socket: PathBuf,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct SessionDescriptor {
     pub name: String,
-    pub running: bool,
     pub socket_path: PathBuf,
 }
 
 #[derive(Debug, Clone)]
 pub struct HerdrTarget {
     pub session: String,
-    pub socket_path: PathBuf,
-    pub pane_id: String,
-    pub terminal_id: String,
+    pub app_socket: PathBuf,
+    pub terminal: String,
     pub state_change_seq: u64,
-    pub revision: u64,
 }
 
 #[derive(Debug)]
@@ -66,128 +67,75 @@ pub struct SessionObservation {
     pub session: SessionView,
     pub agents: Vec<AgentView>,
     pub targets: HashMap<String, HerdrTarget>,
-    pub pane_ids: Vec<String>,
-    pub agent_order: Option<AgentOrderMode>,
-    /// The server has no ordering API at all, so the daemon owns the
-    /// preference instead of reporting ordering as unavailable.
-    pub daemon_owned_order: bool,
 }
 
 #[derive(Debug, Deserialize)]
-struct SessionList {
-    sessions: Vec<SessionDescriptor>,
-}
-
-#[derive(Debug, Deserialize)]
-struct PingResult {
-    result: Pong,
-}
-
-#[derive(Debug, Deserialize)]
-struct Pong {
+struct StatusResult {
     version: String,
-    protocol: u32,
 }
 
 #[derive(Debug, Deserialize)]
-struct SnapshotResponse {
-    result: SnapshotResult,
-}
-
-#[derive(Debug, Deserialize)]
-struct SnapshotResult {
-    snapshot: HerdrSnapshot,
-}
-
-#[derive(Debug, Deserialize)]
-struct HerdrSnapshot {
-    #[serde(default)]
-    workspaces: Vec<HerdrWorkspace>,
-    #[serde(default)]
-    tabs: Vec<HerdrTab>,
-    #[serde(default)]
-    agents: Vec<HerdrAgent>,
-}
-
-#[derive(Debug, Deserialize)]
-struct HerdrWorkspace {
-    workspace_id: String,
-    label: String,
-    #[serde(default)]
-    worktree: Option<HerdrWorkspaceWorktree>,
-}
-
-#[derive(Debug, Deserialize)]
-struct HerdrWorkspaceWorktree {
-    repo_name: String,
-    checkout_path: PathBuf,
-    #[serde(default)]
-    is_linked_worktree: bool,
-}
-
-#[derive(Debug, Deserialize)]
-struct HerdrTab {
-    tab_id: String,
-    #[serde(default)]
-    label: String,
+struct ListResult {
+    terminals: Vec<CoreTerminal>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct HerdrAgent {
-    terminal_id: String,
-    #[serde(default)]
-    agent: Option<String>,
-    #[serde(default)]
-    display_agent: Option<String>,
+struct CoreTerminal {
+    address: String,
+    state: String,
+    labels: HashMap<String, String>,
+    cwd: PathBuf,
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
-    agent_status: AgentStatus,
-    workspace_id: String,
+    parent: Option<String>,
     #[serde(default)]
-    tab_id: String,
-    pane_id: String,
+    status: Option<CoreStatus>,
     #[serde(default)]
-    focused: bool,
+    status_ms: Option<u64>,
     #[serde(default)]
-    launch_pending: bool,
+    foreground: Option<Foreground>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CoreStatus {
+    state: String,
     #[serde(default)]
-    state_change_seq: u64,
+    app: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct Foreground {
+    #[serde(default)]
+    name: Option<String>,
     #[serde(default)]
     cwd: Option<PathBuf>,
-    #[serde(default)]
-    foreground_cwd: Option<PathBuf>,
-    #[serde(default)]
-    revision: u64,
-    #[serde(flatten)]
-    extra: HashMap<String, Value>,
 }
 
 impl HerdrClient {
-    pub fn new(binary: impl Into<PathBuf>) -> Self {
+    pub fn new(core_socket: impl Into<PathBuf>, app_socket: impl Into<PathBuf>) -> Self {
         Self {
-            binary: binary.into(),
+            core_socket: core_socket.into(),
+            app_socket: app_socket.into(),
         }
     }
 
+    /// The local herdr-core, when its socket exists. Discovery never starts a
+    /// core: the `hc` CLI would, and a dashboard must not.
     pub async fn discover(&self) -> Result<Vec<SessionDescriptor>> {
-        let output = Command::new(&self.binary)
-            .args(["session", "list", "--json"])
-            .stdin(Stdio::null())
-            .stderr(Stdio::piped())
-            .output()
-            .await
-            .with_context(|| format!("running {} session list", self.binary.display()))?;
-        if !output.status.success() {
-            bail!(
-                "herdr session list failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
+        match tokio::fs::symlink_metadata(&self.core_socket).await {
+            Ok(_) => Ok(vec![SessionDescriptor {
+                name: session_name(&self.core_socket),
+                socket_path: self.core_socket.clone(),
+            }]),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(error) => Err(error).with_context(|| {
+                format!(
+                    "inspecting herdr-core socket {}",
+                    self.core_socket.display()
+                )
+            }),
         }
-        let mut sessions: SessionList =
-            serde_json::from_slice(&output.stdout).context("parsing Herdr session list")?;
-        sessions.sessions.retain(|session| session.running);
-        Ok(sessions.sessions)
     }
 
     pub async fn observe_session(
@@ -197,225 +145,59 @@ impl HerdrClient {
         source_offset: usize,
         now_ms: u64,
     ) -> Result<SessionObservation> {
-        let ping: PingResult = request(
+        let status: StatusResult =
+            core_request(&descriptor.socket_path, "server.status", json!({})).await?;
+        let list: ListResult = core_request(
             &descriptor.socket_path,
-            json!({"id": request_id(), "method": "ping", "params": {}}),
+            "terminal.list",
+            json!({"all": false, "labels": {}}),
         )
         .await?;
-        if !SUPPORTED_HERDR_PROTOCOLS.contains(&ping.result.protocol) {
-            return Ok(SessionObservation {
-                session: SessionView {
-                    name: descriptor.name.clone(),
-                    state: SessionState::Incompatible,
-                    version: Some(ping.result.version),
-                    protocol: Some(ping.result.protocol),
-                    last_sync_ms: Some(now_ms),
-                    message: Some(format!(
-                        "Herdr protocol {} is unsupported; expected {}",
-                        ping.result.protocol,
-                        supported_protocols_label()
-                    )),
-                },
-                agents: Vec::new(),
-                targets: HashMap::new(),
-                pane_ids: Vec::new(),
-                agent_order: None,
-                daemon_owned_order: false,
-            });
-        }
-        let response: SnapshotResponse = request(
-            &descriptor.socket_path,
-            json!({"id": request_id(), "method": "session.snapshot", "params": {}}),
-        )
-        .await?;
-        // Stock Herdr has no ordering API, so asking would only return an
-        // unknown-method error on every refresh.
-        let daemon_owned_order = ping.result.protocol == STOCK_HERDR_PROTOCOL;
-        let agent_order = if daemon_owned_order {
-            None
-        } else {
-            match self.get_agent_order(descriptor).await {
-                Ok(mode) => Some(mode),
-                Err(error) => {
-                    tracing::debug!(session = %descriptor.name, %error, "Herdr agent ordering API unavailable");
-                    None
-                }
+        // Focus is best effort: the Herdr app window may be closed while its
+        // agents keep running in the core.
+        let focused_terminal = match self.focused_terminal().await {
+            Ok(terminal) => terminal,
+            Err(error) => {
+                tracing::debug!(%error, "Herdr app focus is unavailable");
+                None
             }
         };
 
-        let workspaces: HashMap<_, _> = response
-            .result
-            .snapshot
-            .workspaces
-            .into_iter()
-            .map(|workspace| (workspace.workspace_id.clone(), workspace))
-            .collect();
-        let tabs: HashMap<_, _> = response
-            .result
-            .snapshot
-            .tabs
-            .into_iter()
-            .map(|tab| (tab.tab_id, tab.label))
-            .collect();
-        let mut targets = HashMap::new();
-        let mut pane_ids = Vec::new();
-        let mut agents = Vec::new();
-
-        for (index, raw) in response.result.snapshot.agents.into_iter().enumerate() {
-            let id = opaque_agent_id(daemon_epoch, &descriptor.name, &raw.terminal_id);
-            let workspace = workspaces.get(&raw.workspace_id);
-            // Herdr's workspace number means nothing on the EDGE; its name does.
-            let workspace_label = workspace
-                .and_then(|workspace| nonblank(Some(workspace.label.as_str())))
-                .map_or_else(|| raw.workspace_id.clone(), str::to_owned);
-            let agent_name = nonblank(raw.agent.as_deref()).unwrap_or("agent").to_owned();
-            let display_name = display_name(
-                &raw,
-                &tabs,
-                &agent_name,
-                workspace.map(|workspace| workspace.label.as_str()),
-            );
-            let cwd = raw.foreground_cwd.as_ref().or(raw.cwd.as_ref());
-            let repository = workspace
-                .and_then(|workspace| workspace.worktree.as_ref())
-                .map(|worktree| worktree.repo_name.clone())
-                .or_else(|| {
-                    cwd.and_then(|path| path.file_name())
-                        .map(|name| name.to_string_lossy().into_owned())
-                });
-            let worktree = workspace
-                .and_then(|workspace| workspace.worktree.as_ref())
-                .filter(|worktree| worktree.is_linked_worktree)
-                .and_then(|worktree| worktree.checkout_path.file_name())
-                .map(|name| name.to_string_lossy().into_owned());
-            let branch = cwd.and_then(|path| git_branch(path));
-            let actions = actions_from_extra(&raw.extra, raw.revision);
-
-            targets.insert(
-                id.clone(),
-                HerdrTarget {
-                    session: descriptor.name.clone(),
-                    socket_path: descriptor.socket_path.clone(),
-                    pane_id: raw.pane_id.clone(),
-                    terminal_id: raw.terminal_id,
-                    state_change_seq: raw.state_change_seq,
-                    revision: raw.revision,
-                },
-            );
-            pane_ids.push(raw.pane_id);
-            agents.push(AgentView {
-                id,
-                display_name,
-                agent: agent_name,
-                status: raw.agent_status,
-                review_ready: false,
-                launch_pending: raw.launch_pending,
-                workspace: workspace_label,
-                repository,
-                worktree,
-                branch,
-                session: descriptor.name.clone(),
-                focused: raw.focused,
-                observed_for_seconds: 0,
-                state_change_seq: raw.state_change_seq,
-                source_order: source_offset + index,
-                actions: AgentActions {
-                    open: true,
-                    zoom: true,
-                    ..actions
-                },
-            });
-        }
-
+        let (agents, targets) = build_agents(
+            &list.terminals,
+            &descriptor.name,
+            &self.app_socket,
+            focused_terminal.as_deref(),
+            daemon_epoch,
+            source_offset,
+        );
         Ok(SessionObservation {
             session: SessionView {
                 name: descriptor.name.clone(),
                 state: SessionState::Connected,
-                version: Some(ping.result.version),
-                protocol: Some(ping.result.protocol),
+                version: Some(status.version),
+                protocol: None,
                 last_sync_ms: Some(now_ms),
                 message: None,
             },
             agents,
             targets,
-            pane_ids,
-            agent_order,
-            daemon_owned_order,
         })
     }
 
-    pub async fn set_agent_order(
-        &self,
-        descriptor: &SessionDescriptor,
-        mode: AgentOrderMode,
-    ) -> Result<()> {
-        let order = match mode {
-            AgentOrderMode::Grouped => "grouped",
-            AgentOrderMode::Priority => "priority",
-        };
-        let response: Value = request(
-            &descriptor.socket_path,
-            json!({
-                "id": request_id(),
-                "method": "agent.order.set",
-                "params": {"order": order}
-            }),
+    /// Shows the agent in the Herdr app. The app owns its window and layout;
+    /// this sends only the typed `agent.focus` command for one terminal.
+    pub async fn focus(&self, target: &HerdrTarget) -> Result<()> {
+        let response = app_request(
+            &target.app_socket,
+            json!({"do": "agent.focus", "args": {"terminal": target.terminal}}),
         )
         .await?;
         if let Some(error) = response.get("error") {
-            bail!("Herdr agent ordering failed: {error}");
+            bail!("Herdr app refused agent focus: {error}");
         }
-        if response["result"]["type"] != "agent_order" || response["result"]["order"] != order {
-            bail!("unexpected Herdr agent ordering response");
-        }
-        Ok(())
-    }
-
-    pub async fn get_agent_order(&self, descriptor: &SessionDescriptor) -> Result<AgentOrderMode> {
-        read_agent_order(&descriptor.socket_path).await
-    }
-
-    pub async fn perform(
-        &self,
-        target: &HerdrTarget,
-        action: ActionKind,
-        capability_id: Option<&str>,
-    ) -> Result<()> {
-        let payload = match action {
-            ActionKind::Open => {
-                json!({"id": request_id(), "method": "agent.focus", "params": {"target": target.pane_id}})
-            }
-            ActionKind::Zoom => {
-                json!({"id": request_id(), "method": "pane.zoom", "params": {"pane_id": target.pane_id, "mode": "toggle"}})
-            }
-            ActionKind::Approve | ActionKind::Interrupt => {
-                let capability_id = capability_id.ok_or_else(|| anyhow!("missing capability"))?;
-                json!({"id": request_id(), "method": "agent.perform_action", "params": {"capability_id": capability_id}})
-            }
-            ActionKind::RestoreFocus
-            | ActionKind::DesktopApp
-            | ActionKind::SpotifyPlayPause
-            | ActionKind::SpotifyNext
-            | ActionKind::SpotifyPrevious
-            | ActionKind::BasecampOpen
-            | ActionKind::SlackOpen
-            | ActionKind::GithubOpen
-            | ActionKind::GameShow => {
-                bail!("action is owned by the desktop adapter")
-            }
-            ActionKind::VoiceStart | ActionKind::VoiceStop | ActionKind::VoiceCancel => {
-                bail!("voice action is not a Herdr action")
-            }
-            ActionKind::OrderGrouped | ActionKind::OrderPriority => {
-                bail!("agent ordering is not an agent-target action")
-            }
-            ActionKind::BackendHerdr | ActionKind::BackendT3code => {
-                bail!("agent manager selection is not an agent-target action")
-            }
-        };
-        let response: Value = request(&target.socket_path, payload).await?;
-        if let Some(error) = response.get("error") {
-            bail!("Herdr action failed: {error}");
+        if response.get("ok") != Some(&Value::Bool(true)) {
+            bail!("unexpected Herdr app focus response");
         }
         Ok(())
     }
@@ -423,7 +205,6 @@ impl HerdrClient {
     pub fn spawn_subscription(
         &self,
         descriptor: SessionDescriptor,
-        pane_ids: Vec<String>,
         invalidations: mpsc::Sender<String>,
     ) -> (
         tokio::task::JoinHandle<()>,
@@ -431,281 +212,416 @@ impl HerdrClient {
     ) {
         let (ready_tx, ready_rx) = oneshot::channel();
         let handle = tokio::spawn(async move {
-            if let Err(error) = watch_events(&descriptor, &pane_ids, &invalidations, ready_tx).await
-            {
-                tracing::warn!(session = %descriptor.name, %error, "Herdr event subscription ended");
+            if let Err(error) = watch_events(&descriptor, &invalidations, ready_tx).await {
+                tracing::warn!(session = %descriptor.name, %error, "herdr-core event subscription ended");
             }
             let _ = invalidations.try_send(descriptor.name);
         });
         (handle, ready_rx)
     }
+
+    /// The terminal in the Herdr app's focused pane, if the app is running.
+    async fn focused_terminal(&self) -> Result<Option<String>> {
+        if tokio::fs::symlink_metadata(&self.app_socket).await.is_err() {
+            return Ok(None);
+        }
+        let status = app_request(&self.app_socket, json!({"status": true})).await?;
+        let Some(pane) = status.get("focused_pane").and_then(Value::as_str) else {
+            return Ok(None);
+        };
+        let listing = app_request(&self.app_socket, json!({"ls": true})).await?;
+        Ok(terminal_in_pane(&listing, pane))
+    }
 }
 
-async fn read_agent_order(socket_path: &Path) -> Result<AgentOrderMode> {
-    let response: Value = request(
-        socket_path,
-        json!({"id": request_id(), "method": "agent.order.get", "params": {}}),
-    )
-    .await?;
-    if let Some(error) = response.get("error") {
-        bail!("Herdr agent ordering failed: {error}");
+fn session_name(socket: &Path) -> String {
+    socket
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or("default")
+        .to_owned()
+}
+
+fn terminal_in_pane(listing: &Value, pane: &str) -> Option<String> {
+    let spaces = listing.get("spaces")?.as_array()?;
+    spaces
+        .iter()
+        .filter_map(|space| space.get("tabs")?.as_array())
+        .flatten()
+        .filter_map(|tab| tab.get("terminals")?.as_array())
+        .flatten()
+        .find(|terminal| terminal.get("pane").and_then(Value::as_str) == Some(pane))
+        .and_then(|terminal| terminal.get("terminal")?.as_str())
+        .map(str::to_owned)
+}
+
+fn build_agents(
+    terminals: &[CoreTerminal],
+    session: &str,
+    app_socket: &Path,
+    focused_terminal: Option<&str>,
+    daemon_epoch: &str,
+    source_offset: usize,
+) -> (Vec<AgentView>, HashMap<String, HerdrTarget>) {
+    let by_address: HashMap<&str, &CoreTerminal> = terminals
+        .iter()
+        .map(|terminal| (terminal.address.as_str(), terminal))
+        .collect();
+    let mut agents = Vec::new();
+    let mut targets = HashMap::new();
+
+    for raw in terminals {
+        if raw.state != "live" {
+            continue;
+        }
+        let Some(status) = raw.status.as_ref() else {
+            continue;
+        };
+        // Only terminals the Herdr app shows can be focused there: its own,
+        // and sub-agents started from them.
+        let Some(home) = herdr_home(raw, &by_address) else {
+            continue;
+        };
+        let (space, tab) = split_where(home.labels.get(WHERE_LABEL).map(String::as_str));
+        let agent_name = nonblank(status.app.as_deref())
+            .or_else(|| nonblank(raw.foreground.as_ref().and_then(|fg| fg.name.as_deref())))
+            .unwrap_or("agent")
+            .to_owned();
+        let display_name = display_name(raw.name.as_deref(), tab, &agent_name, space);
+        let cwd = raw
+            .foreground
+            .as_ref()
+            .and_then(|foreground| foreground.cwd.as_deref())
+            .unwrap_or(&raw.cwd);
+        let location = git_location(cwd);
+        let id = opaque_agent_id(daemon_epoch, session, &raw.address);
+        let state_change_seq = raw.status_ms.unwrap_or_default();
+
+        targets.insert(
+            id.clone(),
+            HerdrTarget {
+                session: session.to_owned(),
+                app_socket: app_socket.to_path_buf(),
+                terminal: raw.address.clone(),
+                state_change_seq,
+            },
+        );
+        agents.push(AgentView {
+            id,
+            display_name,
+            agent: agent_name,
+            status: agent_status(&status.state),
+            review_ready: false,
+            launch_pending: false,
+            workspace: space.unwrap_or("Herdr").to_owned(),
+            repository: location
+                .as_ref()
+                .map(|location| location.repository.clone())
+                .or_else(|| {
+                    cwd.file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                }),
+            worktree: location
+                .as_ref()
+                .and_then(|location| location.worktree.clone()),
+            branch: location.and_then(|location| location.branch),
+            session: session.to_owned(),
+            focused: focused_terminal == Some(raw.address.as_str()),
+            observed_for_seconds: 0,
+            state_change_seq,
+            source_order: source_offset + agents.len(),
+            actions: AgentActions {
+                open: true,
+                ..AgentActions::default()
+            },
+        });
     }
-    if response["result"]["type"] != "agent_order" {
-        bail!("unexpected Herdr agent ordering response");
+    (agents, targets)
+}
+
+/// The terminal whose Herdr app labels place this one: itself, or the
+/// nearest ancestor that carries them. Parent links are set once at start,
+/// but the walk is bounded and cycle-safe regardless.
+fn herdr_home<'a>(
+    terminal: &'a CoreTerminal,
+    by_address: &HashMap<&str, &'a CoreTerminal>,
+) -> Option<&'a CoreTerminal> {
+    let mut current = terminal;
+    let mut seen = HashSet::new();
+    loop {
+        if current.labels.contains_key(SPACE_LABEL) {
+            return Some(current);
+        }
+        if !seen.insert(current.address.as_str()) || seen.len() > 32 {
+            return None;
+        }
+        current = by_address.get(current.parent.as_deref()?)?;
     }
-    let mode = match response["result"]["order"].as_str() {
-        Some("grouped") => AgentOrderMode::Grouped,
-        Some("priority") => AgentOrderMode::Priority,
-        _ => bail!("unexpected Herdr agent ordering response"),
+}
+
+/// The Herdr app writes `where` as `<space> / <tab>`.
+fn split_where(value: Option<&str>) -> (Option<&str>, Option<&str>) {
+    let Some(value) = nonblank(value) else {
+        return (None, None);
     };
-    Ok(mode)
+    match value.split_once(" / ") {
+        Some((space, tab)) => (nonblank(Some(space)), nonblank(Some(tab))),
+        None => (Some(value), None),
+    }
 }
 
-/// The name given to the agent's pane wins, then a named tab. Herdr numbers
+fn agent_status(state: &str) -> AgentStatus {
+    match state {
+        "working" => AgentStatus::Working,
+        // `error` needs a person just like a permission or question does.
+        "blocked" | "error" => AgentStatus::Blocked,
+        "done" => AgentStatus::Done,
+        "idle" => AgentStatus::Idle,
+        _ => AgentStatus::Unknown,
+    }
+}
+
+/// The terminal's own name wins, then a named tab. The Herdr app numbers
 /// unnamed tabs, so an all-digit label says nothing; with neither, the card
-/// is `<agent> · <workspace>`. A name equal to the agent type counts as none.
+/// is `<agent> · <space>`. A name equal to the agent type counts as none.
 fn display_name(
-    raw: &HerdrAgent,
-    tabs: &HashMap<String, String>,
+    name: Option<&str>,
+    tab: Option<&str>,
     agent_name: &str,
-    workspace: Option<&str>,
+    space: Option<&str>,
 ) -> String {
-    let given = nonblank(raw.display_agent.as_deref())
-        .or_else(|| nonblank(raw.name.as_deref()))
-        .filter(|name| !name.eq_ignore_ascii_case(agent_name));
-    if let Some(name) = given {
+    if let Some(name) = nonblank(name).filter(|name| !name.eq_ignore_ascii_case(agent_name)) {
         return name.to_owned();
     }
-    if let Some(label) = tabs
-        .get(&raw.tab_id)
-        .and_then(|label| nonblank(Some(label)))
-        .filter(|label| !label.chars().all(|character| character.is_ascii_digit()))
+    if let Some(tab) =
+        nonblank(tab).filter(|tab| !tab.chars().all(|character| character.is_ascii_digit()))
     {
-        return label.to_owned();
+        return tab.to_owned();
     }
-    match nonblank(workspace) {
-        Some(workspace) => format!("{agent_name} · {workspace}"),
+    match nonblank(space) {
+        Some(space) => format!("{agent_name} · {space}"),
         None => agent_name.to_owned(),
     }
 }
 
-/// The branch checked out in the repository containing `start`, read from
-/// git's own files (a `.git` directory, or a worktree's `gitdir:` pointer)
-/// without running git. A detached HEAD yields its short commit.
-fn git_branch(start: &Path) -> Option<String> {
+#[derive(Debug, PartialEq, Eq)]
+struct GitLocation {
+    repository: String,
+    worktree: Option<String>,
+    branch: Option<String>,
+}
+
+/// The repository containing `start`, read from git's own files (a `.git`
+/// directory, or a linked worktree's `gitdir:` pointer) without running git.
+/// A detached HEAD yields its short commit.
+fn git_location(start: &Path) -> Option<GitLocation> {
     let mut directory = Some(start);
     for _ in 0..32 {
         let current = directory?;
         let dot_git = current.join(".git");
         if let Ok(metadata) = std::fs::metadata(&dot_git) {
-            let git_dir = if metadata.is_dir() {
-                dot_git
+            let checkout_name = current.file_name()?.to_string_lossy().into_owned();
+            let (git_dir, repository, worktree) = if metadata.is_dir() {
+                (dot_git, checkout_name, None)
             } else {
                 let pointer = std::fs::read_to_string(&dot_git).ok()?;
-                let target = pointer.strip_prefix("gitdir:")?.trim();
-                let target = Path::new(target);
-                if target.is_absolute() {
+                let target = Path::new(pointer.strip_prefix("gitdir:")?.trim());
+                let git_dir = if target.is_absolute() {
                     target.to_path_buf()
                 } else {
                     current.join(target)
+                };
+                // `<repo>/.git/worktrees/<name>` names the main repository.
+                let repository = git_dir
+                    .parent()
+                    .filter(|parent| parent.file_name().is_some_and(|name| name == "worktrees"))
+                    .and_then(Path::parent)
+                    .filter(|parent| parent.file_name().is_some_and(|name| name == ".git"))
+                    .and_then(Path::parent)
+                    .and_then(Path::file_name)
+                    .map(|name| name.to_string_lossy().into_owned());
+                match repository {
+                    Some(repository) => (git_dir, repository, Some(checkout_name)),
+                    None => (git_dir, checkout_name, None),
                 }
             };
-            let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
-            let head = head.trim();
-            let branch = match head.strip_prefix("ref: refs/heads/") {
-                Some(branch) => branch.to_owned(),
-                None if head.len() >= 7 && head.bytes().all(|byte| byte.is_ascii_hexdigit()) => {
-                    head[..7].to_owned()
-                }
-                None => return None,
-            };
-            let safe = !branch.is_empty()
-                && branch.len() <= 64
-                && branch
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || b"-_./+".contains(&byte));
-            return safe.then_some(branch);
+            return Some(GitLocation {
+                repository,
+                worktree,
+                branch: read_branch(&git_dir),
+            });
         }
         directory = current.parent();
     }
     None
 }
 
+fn read_branch(git_dir: &Path) -> Option<String> {
+    let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let head = head.trim();
+    let branch = match head.strip_prefix("ref: refs/heads/") {
+        Some(branch) => branch.to_owned(),
+        None if head.len() >= 7 && head.bytes().all(|byte| byte.is_ascii_hexdigit()) => {
+            head[..7].to_owned()
+        }
+        None => return None,
+    };
+    let safe = !branch.is_empty()
+        && branch.len() <= 64
+        && branch
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_./+".contains(&byte));
+    safe.then_some(branch)
+}
+
 fn nonblank(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
 }
 
-fn actions_from_extra(extra: &HashMap<String, Value>, revision: u64) -> AgentActions {
-    let values = extra.get("actions").and_then(Value::as_array);
-    let Some(values) = values else {
-        return AgentActions::default();
-    };
-
-    let mut actions = AgentActions::default();
-    for value in values {
-        let Some(kind) = value.get("action").and_then(Value::as_str) else {
-            continue;
-        };
-        let Some(capability_id) = value.get("capability_id").and_then(Value::as_str) else {
-            continue;
-        };
-        let Some(action_kind) = (match kind {
-            "approve" => Some(ActionKind::Approve),
-            "interrupt" => Some(ActionKind::Interrupt),
-            _ => None,
-        }) else {
-            continue;
-        };
-        let capability = ActionCapability {
-            capability_id: capability_id.to_owned(),
-            kind: action_kind,
-            expires_at_ms: value
-                .get("expires_at_unix_ms")
-                .and_then(Value::as_u64)
-                .unwrap_or_default(),
-            expected_revision: value
-                .get("revision")
-                .and_then(Value::as_u64)
-                .unwrap_or(revision),
-        };
-        match action_kind {
-            ActionKind::Approve => actions.approve = Some(capability),
-            ActionKind::Interrupt => actions.interrupt = Some(capability),
-            _ => {}
-        }
-    }
-    actions
-}
-
 async fn watch_events(
     descriptor: &SessionDescriptor,
-    pane_ids: &[String],
     invalidations: &mpsc::Sender<String>,
     ready: oneshot::Sender<Result<(), String>>,
 ) -> Result<()> {
-    let mut subscriptions = vec![
-        json!({"type": "workspace.created"}),
-        json!({"type": "workspace.updated"}),
-        json!({"type": "workspace.renamed"}),
-        json!({"type": "workspace.moved"}),
-        json!({"type": "workspace.closed"}),
-        json!({"type": "workspace.focused"}),
-        json!({"type": "tab.created"}),
-        json!({"type": "tab.closed"}),
-        json!({"type": "tab.focused"}),
-        json!({"type": "tab.renamed"}),
-        json!({"type": "tab.moved"}),
-        json!({"type": "pane.created"}),
-        json!({"type": "pane.closed"}),
-        json!({"type": "pane.focused"}),
-        json!({"type": "pane.moved"}),
-        json!({"type": "pane.exited"}),
-        json!({"type": "pane.agent_detected"}),
-    ];
-    subscriptions.extend(
-        pane_ids
-            .iter()
-            .map(|pane_id| json!({"type": "pane.agent_status_changed", "pane_id": pane_id})),
-    );
-
-    let stream = match timeout(
-        REQUEST_TIMEOUT,
-        UnixStream::connect(&descriptor.socket_path),
-    )
-    .await
-    {
-        Ok(Ok(stream)) => stream,
-        Ok(Err(error)) => {
-            let message = format!(
-                "connecting subscription {}: {error}",
-                descriptor.socket_path.display()
-            );
-            let _ = ready.send(Err(message.clone()));
-            bail!(message);
-        }
-        Err(_) => {
-            let message = "timed out connecting subscription".to_owned();
-            let _ = ready.send(Err(message.clone()));
-            bail!(message);
-        }
-    };
-    let (read, mut write) = stream.into_split();
-    let request = json!({
-        "id": request_id(),
-        "method": "events.subscribe",
-        "params": {"subscriptions": subscriptions}
-    });
-    write
-        .write_all(serde_json::to_string(&request)?.as_bytes())
-        .await?;
-    write.write_all(b"\n").await?;
-    write.flush().await?;
-
-    let mut lines = BufReader::new(read).lines();
-    let acknowledgement = match timeout(REQUEST_TIMEOUT, lines.next_line()).await {
-        Ok(Ok(Some(line))) => line,
-        Ok(Ok(None)) => {
-            let message = "subscription closed before acknowledgement".to_owned();
-            let _ = ready.send(Err(message.clone()));
-            bail!(message);
-        }
-        Ok(Err(error)) => {
-            let message = format!("reading subscription acknowledgement: {error}");
-            let _ = ready.send(Err(message.clone()));
-            bail!(message);
-        }
-        Err(_) => {
-            let message = "timed out waiting for subscription acknowledgement".to_owned();
-            let _ = ready.send(Err(message.clone()));
-            bail!(message);
-        }
-    };
-    let acknowledgement: Value = match serde_json::from_str(&acknowledgement) {
-        Ok(value) => value,
+    let id = request_id();
+    // The write half stays alive for the whole stream: closing it is how a
+    // client ends its subscription.
+    let (mut lines, _write) = match subscribe(&descriptor.socket_path, &id).await {
+        Ok(stream) => stream,
         Err(error) => {
-            let message = format!("parsing subscription acknowledgement: {error}");
-            let _ = ready.send(Err(message.clone()));
-            bail!(message);
+            let _ = ready.send(Err(format!("{error:#}")));
+            return Err(error);
         }
     };
-    if acknowledgement["result"]["type"] != "subscription_started" {
-        let message = format!("unexpected subscription acknowledgement: {acknowledgement}");
-        let _ = ready.send(Err(message.clone()));
-        bail!(message);
-    }
     let _ = ready.send(Ok(()));
 
     while let Some(line) = lines.next_line().await? {
-        if serde_json::from_str::<Value>(&line).is_ok() {
+        let Ok(message) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if invalidates(&message) {
             let _ = invalidations.try_send(descriptor.name.clone());
         }
     }
-    bail!("Herdr subscription reached EOF")
+    bail!("herdr-core subscription reached EOF")
 }
 
-async fn request<T: for<'de> Deserialize<'de>>(socket: &Path, request: Value) -> Result<T> {
-    let stream = timeout(REQUEST_TIMEOUT, UnixStream::connect(socket))
+type Lines = tokio::io::Lines<BufReader<OwnedReadHalf>>;
+
+/// Opens an event stream and waits for the subscription's snapshot reply,
+/// which is the acknowledgement that every later fact change will arrive.
+async fn subscribe(socket: &Path, id: &str) -> Result<(Lines, OwnedWriteHalf)> {
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "events.subscribe",
+        "params": {"children_of": null, "labels": {}, "terminal": null}
+    });
+    let (mut lines, write) = timeout(REQUEST_TIMEOUT, send_line(socket, &request))
         .await
-        .context("timed out connecting to Herdr")?
-        .with_context(|| format!("connecting to Herdr socket {}", socket.display()))?;
+        .context("timed out connecting subscription")??;
+    let acknowledgement = timeout(REQUEST_TIMEOUT, async {
+        loop {
+            let Some(line) = lines.next_line().await? else {
+                bail!("subscription closed before acknowledgement");
+            };
+            let message: Value =
+                serde_json::from_str(&line).context("parsing subscription acknowledgement")?;
+            if message.get("id").and_then(Value::as_str) == Some(id) {
+                return Ok(message);
+            }
+        }
+    })
+    .await
+    .context("timed out waiting for subscription acknowledgement")??;
+    if let Some(error) = acknowledgement.get("error") {
+        bail!("herdr-core refused the subscription: {error}");
+    }
+    let result = &acknowledgement["result"];
+    if !result["seq"].is_u64() || !result["terminals"].is_array() {
+        bail!("unexpected subscription acknowledgement");
+    }
+    Ok((lines, write))
+}
+
+/// Whether a subscription message can change the roster. Unknown fact types
+/// invalidate, so a newer core fails toward refreshing, never toward a
+/// stale card; a `missed` notice means changes were dropped.
+fn invalidates(message: &Value) -> bool {
+    match message.get("method").and_then(Value::as_str) {
+        Some("event") => message["params"]["type"]
+            .as_str()
+            .is_none_or(|kind| !IGNORED_EVENTS.contains(&kind)),
+        Some("heartbeat") => false,
+        Some(_) => true,
+        None => false,
+    }
+}
+
+async fn core_request<T: for<'de> Deserialize<'de>>(
+    socket: &Path,
+    method: &str,
+    params: Value,
+) -> Result<T> {
+    let id = request_id();
+    let request = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+    let response = timeout(REQUEST_TIMEOUT, async {
+        let (mut lines, _write) = send_line(socket, &request).await?;
+        loop {
+            let line = lines
+                .next_line()
+                .await?
+                .ok_or_else(|| anyhow!("herdr-core closed without a response"))?;
+            let message: Value = serde_json::from_str(&line).context("parsing herdr-core reply")?;
+            if message.get("id").and_then(Value::as_str) == Some(id.as_str()) {
+                return Ok::<_, anyhow::Error>(message);
+            }
+        }
+    })
+    .await
+    .with_context(|| format!("timed out waiting for herdr-core {method}"))??;
+    if let Some(error) = response.get("error") {
+        bail!("herdr-core {method} failed: {error}");
+    }
+    let result = response
+        .get("result")
+        .cloned()
+        .ok_or_else(|| anyhow!("herdr-core {method} reply has no result"))?;
+    serde_json::from_value(result).with_context(|| format!("herdr-core {method} schema changed"))
+}
+
+async fn app_request(socket: &Path, request: Value) -> Result<Value> {
+    let response = timeout(REQUEST_TIMEOUT, async {
+        let (mut lines, _write) = send_line(socket, &request).await?;
+        lines
+            .next_line()
+            .await?
+            .ok_or_else(|| anyhow!("Herdr app closed without a response"))
+    })
+    .await
+    .context("timed out waiting for the Herdr app")??;
+    serde_json::from_str(&response).context("parsing Herdr app reply")
+}
+
+/// Sends one JSON line and returns the reply stream with the write half,
+/// which the caller keeps open until it has its reply.
+async fn send_line(socket: &Path, request: &Value) -> Result<(Lines, OwnedWriteHalf)> {
+    let stream = UnixStream::connect(socket)
+        .await
+        .with_context(|| format!("connecting to {}", socket.display()))?;
     let (read, mut write) = stream.into_split();
-    let encoded = serde_json::to_vec(&request)?;
+    let mut encoded = serde_json::to_vec(request)?;
+    encoded.push(b'\n');
     write.write_all(&encoded).await?;
-    write.write_all(b"\n").await?;
     write.flush().await?;
-
-    let mut lines = BufReader::new(read).lines();
-    let response = timeout(REQUEST_TIMEOUT, lines.next_line())
-        .await
-        .context("timed out waiting for Herdr response")??
-        .ok_or_else(|| anyhow!("Herdr closed without a response"))?;
-    serde_json::from_str(&response).with_context(|| format!("parsing Herdr response: {response}"))
+    Ok((BufReader::new(read).lines(), write))
 }
 
-fn opaque_agent_id(epoch: &str, session: &str, terminal_id: &str) -> String {
+fn opaque_agent_id(epoch: &str, session: &str, terminal: &str) -> String {
     Uuid::new_v5(
         &Uuid::NAMESPACE_OID,
-        format!("{epoch}\0{session}\0{terminal_id}").as_bytes(),
+        format!("{epoch}\0{session}\0{terminal}").as_bytes(),
     )
     .to_string()
 }
@@ -719,114 +635,175 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
-    use tokio::{
-        io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-        net::UnixListener,
-        sync::{mpsc, oneshot},
-    };
+    use tokio::net::UnixListener;
+
+    fn terminal(value: Value) -> CoreTerminal {
+        serde_json::from_value(value).unwrap()
+    }
+
+    /// A herdr-core terminal record with the required schema fields.
+    fn record(address: &str, extra: Value) -> Value {
+        let mut value = json!({
+            "address": address,
+            "argv": ["private", "argv"],
+            "cwd": "/nonexistent/project",
+            "state": "live",
+            "created_ms": 1,
+            "screen": "exact",
+            "cols": 80,
+            "rows": 24,
+            "labels": {},
+            "title": "private prompt title"
+        });
+        for (key, field) in extra.as_object().unwrap() {
+            value[key] = field.clone();
+        }
+        value
+    }
+
+    fn herdr_labels(space_where: &str) -> Value {
+        json!({"herdr.space": "sp1", "herdr.tab": "tb1", "where": space_where})
+    }
 
     #[test]
     fn opaque_ids_change_with_daemon_epoch() {
-        let first = opaque_agent_id("one", "default", "terminal");
-        let second = opaque_agent_id("two", "default", "terminal");
-        assert_ne!(first, second);
-        assert_eq!(first, opaque_agent_id("one", "default", "terminal"));
+        let first = opaque_agent_id("one", "default", "t1");
+        assert_ne!(first, opaque_agent_id("two", "default", "t1"));
+        assert_eq!(first, opaque_agent_id("one", "default", "t1"));
     }
 
     #[test]
-    fn legacy_capability_shapes_never_surface_guarded_actions() {
-        let mut extra = HashMap::new();
-        extra.insert(
-            "action_capabilities".into(),
-            json!([{"id":"unsafe","kind":"approve","expires_at_ms":99}]),
+    fn only_live_reporting_herdr_terminals_become_agents() {
+        let terminals = [
+            record(
+                "t1",
+                json!({"labels": herdr_labels("lectern / review"), "name": "lectern-qt",
+                    "status": {"app": "codex", "state": "working", "msg": "private status"},
+                    "status_ms": 42}),
+            ),
+            // A shell reports no status.
+            record("t2", json!({"labels": herdr_labels("lectern / 1")})),
+            // Another app's agent is not shown by the Herdr app.
+            record(
+                "t3",
+                json!({"status": {"app": "claude-code", "state": "blocked"}}),
+            ),
+            // A finished agent is gone.
+            record(
+                "t4",
+                json!({"state": "finished", "labels": herdr_labels("lectern / 1"),
+                    "status": {"app": "codex", "state": "idle"}}),
+            ),
+            // A sub-agent belongs to its parent's space and tab.
+            record(
+                "t5",
+                json!({"parent": "t1", "status": {"app": "claude-code", "state": "error"}}),
+            ),
+        ]
+        .map(terminal);
+
+        let (agents, targets) = build_agents(
+            &terminals,
+            "default",
+            Path::new("/tmp/app.sock"),
+            Some("t5"),
+            "epoch",
+            3,
         );
-        let actions = actions_from_extra(&extra, 1);
-        assert!(actions.approve.is_none());
-        assert!(actions.interrupt.is_none());
+
+        assert_eq!(agents.len(), 2);
+        assert_eq!(agents[0].display_name, "lectern-qt");
+        assert_eq!(agents[0].agent, "codex");
+        assert_eq!(agents[0].workspace, "lectern");
+        assert_eq!(agents[0].status, AgentStatus::Working);
+        assert_eq!(agents[0].state_change_seq, 42);
+        assert_eq!(agents[0].source_order, 3);
+        assert!(!agents[0].focused);
+        assert!(agents[0].actions.open);
+        assert!(!agents[0].actions.zoom);
+        assert!(agents[0].actions.approve.is_none());
+        assert!(agents[0].actions.interrupt.is_none());
+
+        assert_eq!(agents[1].display_name, "review");
+        assert_eq!(agents[1].status, AgentStatus::Blocked);
+        assert_eq!(agents[1].workspace, "lectern");
+        assert!(agents[1].focused);
+        assert_eq!(agents[1].source_order, 4);
+        assert_eq!(targets[&agents[1].id].terminal, "t5");
+
+        // Prompt-bearing fields never reach the portal model.
+        let encoded = serde_json::to_string(&agents).unwrap();
+        for private in ["private prompt title", "private status", "argv"] {
+            assert!(!encoded.contains(private), "{private} leaked");
+        }
     }
 
     #[test]
-    fn public_actions_parse_only_known_capabilities() {
-        let mut extra = HashMap::new();
-        extra.insert(
-            "actions".into(),
-            json!([
-                {"capability_id":"approve-1","action":"approve","expires_at_unix_ms":99,"revision":7},
-                {"capability_id":"interrupt-1","action":"interrupt","expires_at_unix_ms":101,"revision":8},
-                {"capability_id":"other","action":"shell","expires_at_unix_ms":99}
-            ]),
-        );
-        let actions = actions_from_extra(&extra, 3);
-        assert_eq!(
-            actions
-                .approve
-                .as_ref()
-                .map(|value| value.capability_id.as_str()),
-            Some("approve-1")
-        );
-        assert_eq!(
-            actions.interrupt.as_ref().map(|value| (
-                value.capability_id.as_str(),
-                value.expires_at_ms,
-                value.expected_revision
-            )),
-            Some(("interrupt-1", 101, 8))
-        );
+    fn parent_cycles_never_place_an_agent() {
+        let terminals = [
+            record(
+                "t1",
+                json!({"parent": "t2", "status": {"state": "working"}}),
+            ),
+            record(
+                "t2",
+                json!({"parent": "t1", "status": {"state": "working"}}),
+            ),
+        ]
+        .map(terminal);
+        let (agents, _) = build_agents(&terminals, "default", Path::new("/a"), None, "e", 0);
+        assert!(agents.is_empty());
     }
 
     #[test]
-    fn pane_name_wins_over_the_tab_label_in_card_identity() {
-        let response: SnapshotResponse = serde_json::from_value(json!({
-            "result": {
-                "snapshot": {
-                    "tabs": [{"tab_id": "w1:t2", "label": "  review portal  "}],
-                    "agents": [{
-                        "terminal_id": "term",
-                        "agent": "codex",
-                        "name": "agent name",
-                        "display_agent": "display agent",
-                        "title": "private prompt title",
-                        "terminal_title_stripped": "private terminal title",
-                        "workspace_id": "w1",
-                        "tab_id": "w1:t2",
-                        "pane_id": "w1:p2"
-                    }]
-                }
-            }
-        }))
-        .unwrap();
-        let raw = &response.result.snapshot.agents[0];
-        let tabs = response
-            .result
-            .snapshot
-            .tabs
-            .into_iter()
-            .map(|tab| (tab.tab_id, tab.label))
-            .collect();
-
-        assert_eq!(
-            display_name(raw, &tabs, "codex", Some("xeneon")),
-            "display agent"
-        );
-        let mut unnamed = raw.clone();
-        unnamed.display_agent = None;
-        unnamed.name = Some("codex".into());
-        assert_eq!(
-            display_name(&unnamed, &tabs, "codex", Some("xeneon")),
-            "review portal"
-        );
+    fn status_words_map_to_attention_states() {
+        assert_eq!(agent_status("working"), AgentStatus::Working);
+        assert_eq!(agent_status("blocked"), AgentStatus::Blocked);
+        assert_eq!(agent_status("error"), AgentStatus::Blocked);
+        assert_eq!(agent_status("done"), AgentStatus::Done);
+        assert_eq!(agent_status("idle"), AgentStatus::Idle);
+        assert_eq!(agent_status("thinking"), AgentStatus::Unknown);
     }
 
     #[test]
-    fn branch_is_read_from_git_files_including_worktrees() {
+    fn card_names_follow_terminal_tab_then_space() {
+        assert_eq!(
+            display_name(Some("reviewer"), Some("fix"), "codex", Some("x")),
+            "reviewer"
+        );
+        // A name equal to the agent type says nothing.
+        assert_eq!(
+            display_name(Some("Codex"), Some("fix login"), "codex", Some("x")),
+            "fix login"
+        );
+        // The Herdr app numbers unnamed tabs.
+        assert_eq!(
+            display_name(Some(" "), Some("2"), "codex", Some("lectern")),
+            "codex · lectern"
+        );
+        assert_eq!(display_name(None, None, "codex", None), "codex");
+        assert_eq!(
+            split_where(Some("BYBY / website")),
+            (Some("BYBY"), Some("website"))
+        );
+        assert_eq!(split_where(Some("solo")), (Some("solo"), None));
+        assert_eq!(split_where(Some("  ")), (None, None));
+    }
+
+    #[test]
+    fn git_location_reads_repositories_and_linked_worktrees() {
         let temp = tempdir().unwrap();
         let repo = temp.path().join("repo");
         fs::create_dir_all(repo.join(".git")).unwrap();
         fs::create_dir_all(repo.join("src/deep")).unwrap();
         fs::write(repo.join(".git/HEAD"), "ref: refs/heads/feature/edge\n").unwrap();
         assert_eq!(
-            git_branch(&repo.join("src/deep")).as_deref(),
-            Some("feature/edge")
+            git_location(&repo.join("src/deep")),
+            Some(GitLocation {
+                repository: "repo".into(),
+                worktree: None,
+                branch: Some("feature/edge".into()),
+            })
         );
 
         let worktree = temp.path().join("wt");
@@ -843,356 +820,214 @@ mod tests {
             "0123456789abcdef0123456789abcdef01234567\n",
         )
         .unwrap();
-        assert_eq!(git_branch(&worktree).as_deref(), Some("0123456"));
+        assert_eq!(
+            git_location(&worktree),
+            Some(GitLocation {
+                repository: "repo".into(),
+                worktree: Some("wt".into()),
+                branch: Some("0123456".into()),
+            })
+        );
 
         fs::write(repo.join(".git/HEAD"), "ref: refs/heads/evil\u{1b}[2J\n").unwrap();
-        assert_eq!(git_branch(&repo), None);
-        assert_eq!(git_branch(&temp.path().join("nowhere")), None);
+        assert_eq!(git_location(&repo).unwrap().branch, None);
+        assert_eq!(git_location(&temp.path().join("nowhere")), None);
     }
 
     #[test]
-    fn card_identity_uses_only_safe_fallback_fields() {
-        let raw: HerdrAgent = serde_json::from_value(json!({
-            "terminal_id": "term",
-            "agent": "codex",
-            "name": "named agent",
-            "display_agent": "  ",
-            "title": "private prompt title",
-            "terminal_title_stripped": "private terminal title",
-            "workspace_id": "w1",
-            "tab_id": "missing",
-            "pane_id": "w1:p1"
-        }))
-        .unwrap();
-        assert_eq!(
-            display_name(&raw, &HashMap::new(), "codex", None),
-            "named agent"
-        );
-
-        let canonical_only: HerdrAgent = serde_json::from_value(json!({
-            "terminal_id": "term",
-            "agent": "codex",
-            "name": " ",
-            "display_agent": "",
-            "title": "private prompt title",
-            "terminal_title_stripped": "private terminal title",
-            "workspace_id": "w1",
-            "tab_id": "missing",
-            "pane_id": "w1:p1"
-        }))
-        .unwrap();
-        assert_eq!(
-            display_name(&canonical_only, &HashMap::new(), "codex", None),
-            "codex"
-        );
-
-        // Herdr's default numbered tab names carry no meaning.
-        let numbered = HashMap::from([("w1:t1".to_owned(), "1".to_owned())]);
-        let mut in_numbered_tab = canonical_only.clone();
-        in_numbered_tab.tab_id = "w1:t1".into();
-        assert_eq!(
-            display_name(&in_numbered_tab, &numbered, "codex", Some("lectern")),
-            "codex · lectern"
-        );
-        let named = HashMap::from([("w1:t1".to_owned(), "review".to_owned())]);
-        assert_eq!(
-            display_name(&in_numbered_tab, &named, "codex", Some("lectern")),
-            "review"
-        );
-    }
-
-    async fn observe_unsupported_protocol(protocol: u32) -> SessionObservation {
-        let temp = tempdir().unwrap();
-        let socket = temp.path().join("herdr.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let (read, mut write) = stream.into_split();
-            let mut lines = BufReader::new(read).lines();
-            let request: Value =
-                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
-            assert_eq!(request["method"], "ping");
-            let response = format!(
-                "{{\"id\":\"ping\",\"result\":{{\"version\":\"unsupported\",\"protocol\":{protocol}}}}}\n"
-            );
-            write.write_all(response.as_bytes()).await.unwrap();
-        });
-        let descriptor = SessionDescriptor {
-            name: "unsupported".into(),
-            running: true,
-            socket_path: socket,
-        };
-
-        let observation = HerdrClient::new("herdr")
-            .observe_session(&descriptor, "epoch", 0, 1234)
-            .await
-            .unwrap();
-        server.await.unwrap();
-        observation
-    }
-
-    #[tokio::test]
-    async fn unsupported_protocols_never_request_or_surface_session_data() {
-        for protocol in [19, 21, 23, 999] {
-            let observation = observe_unsupported_protocol(protocol).await;
-            assert_eq!(observation.session.state, SessionState::Incompatible);
-            assert_eq!(observation.session.protocol, Some(protocol));
-            assert!(observation.agents.is_empty());
-            assert!(observation.targets.is_empty());
-            assert!(observation.pane_ids.is_empty());
-            assert_eq!(observation.agent_order, None);
+    fn only_card_relevant_facts_invalidate() {
+        let event =
+            |kind: &str| json!({"jsonrpc": "2.0", "method": "event", "params": {"type": kind}});
+        assert!(!invalidates(&event("title")));
+        assert!(!invalidates(&event("size")));
+        assert!(!invalidates(
+            &json!({"method": "heartbeat", "params": {"seq": 1}})
+        ));
+        for kind in [
+            "status", "created", "finished", "removed", "labels", "doc", "new",
+        ] {
+            assert!(invalidates(&event(kind)), "{kind}");
         }
+        assert!(invalidates(&json!({"method": "missed", "params": {}})));
+        assert!(!invalidates(&json!({"id": "x", "result": {}})));
     }
 
     #[tokio::test]
-    async fn herdr_v0_8_protocol_20_requests_and_parses_the_snapshot() {
+    async fn discovery_needs_the_core_socket_and_never_starts_a_core() {
         let temp = tempdir().unwrap();
-        let socket = temp.path().join("herdr.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let (read, mut write) = stream.into_split();
-            let mut lines = BufReader::new(read).lines();
-            let request: Value =
-                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
-            assert_eq!(request["method"], "ping");
-            write
-                .write_all(
-                    b"{\"id\":\"ping\",\"result\":{\"version\":\"0.8.0\",\"protocol\":20}}\n",
-                )
-                .await
-                .unwrap();
-
-            let (stream, _) = listener.accept().await.unwrap();
-            let (read, mut write) = stream.into_split();
-            let mut lines = BufReader::new(read).lines();
-            let request: Value =
-                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
-            assert_eq!(request["method"], "session.snapshot");
-            write
-                .write_all(
-                    b"{\"id\":\"snapshot\",\"result\":{\"snapshot\":{\"workspaces\":[{\"workspace_id\":\"w1\",\"number\":1,\"label\":\"xeneon\"}],\"tabs\":[{\"tab_id\":\"w1:t1\",\"label\":\"review\"}],\"agents\":[{\"terminal_id\":\"term-1\",\"agent\":\"codex\",\"agent_status\":\"blocked\",\"workspace_id\":\"w1\",\"tab_id\":\"w1:t1\",\"pane_id\":\"w1:p1\",\"revision\":4,\"state_change_seq\":9,\"actions\":[{\"capability_id\":\"interrupt-1\",\"action\":\"interrupt\",\"expires_at_unix_ms\":999,\"revision\":4}]}]}}}\n",
-                )
-                .await
-                .unwrap();
-
-            let (stream, _) = listener.accept().await.unwrap();
-            let (read, mut write) = stream.into_split();
-            let mut lines = BufReader::new(read).lines();
-            let request: Value =
-                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
-            assert_eq!(request["method"], "agent.order.get");
-            write
-                .write_all(
-                    b"{\"id\":\"order\",\"result\":{\"type\":\"agent_order\",\"order\":\"grouped\"}}\n",
-                )
-                .await
-                .unwrap();
-        });
-        let descriptor = SessionDescriptor {
-            name: "default".into(),
-            running: true,
-            socket_path: socket,
-        };
-
-        let observation = HerdrClient::new("herdr")
-            .observe_session(&descriptor, "epoch", 0, 1234)
-            .await
-            .unwrap();
-
-        assert_eq!(observation.session.state, SessionState::Connected);
-        assert_eq!(observation.session.version.as_deref(), Some("0.8.0"));
-        assert_eq!(observation.session.protocol, Some(20));
-        assert_eq!(observation.agent_order, Some(AgentOrderMode::Grouped));
-        assert_eq!(observation.agents.len(), 1);
-        assert_eq!(observation.agents[0].display_name, "review");
-        assert_eq!(observation.agents[0].status, AgentStatus::Blocked);
-        assert_eq!(
-            observation.agents[0]
-                .actions
-                .interrupt
-                .as_ref()
-                .map(|capability| capability.capability_id.as_str()),
-            Some("interrupt-1")
-        );
-        server.await.unwrap();
+        let socket = temp.path().join("work.sock");
+        let client = HerdrClient::new(&socket, temp.path().join("app.sock"));
+        assert!(client.discover().await.unwrap().is_empty());
+        let _listener = UnixListener::bind(&socket).unwrap();
+        let sessions = client.discover().await.unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].name, "work");
+        assert_eq!(sessions[0].socket_path, socket);
     }
 
-    #[tokio::test]
-    async fn stock_herdr_v0_9_protocol_22_connects_without_fork_apis() {
-        let temp = tempdir().unwrap();
-        let socket = temp.path().join("herdr.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let (read, mut write) = stream.into_split();
-            let mut lines = BufReader::new(read).lines();
-            let request: Value =
-                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
-            assert_eq!(request["method"], "ping");
-            write
-                .write_all(
-                    b"{\"id\":\"ping\",\"result\":{\"type\":\"pong\",\"version\":\"0.9.1\",\"protocol\":22,\"capabilities\":{\"live_handoff\":true,\"health_check\":true}}}\n",
-                )
-                .await
-                .unwrap();
-
-            let (stream, _) = listener.accept().await.unwrap();
-            let (read, mut write) = stream.into_split();
-            let mut lines = BufReader::new(read).lines();
-            let request: Value =
-                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
-            assert_eq!(request["method"], "session.snapshot");
-            write
-                .write_all(
-                    b"{\"id\":\"snapshot\",\"result\":{\"type\":\"session_snapshot\",\"snapshot\":{\"version\":\"0.9.1\",\"protocol\":22,\"focused_workspace_id\":\"w1\",\"workspaces\":[{\"workspace_id\":\"w1\",\"number\":1,\"label\":\"xeneon\",\"focused\":true,\"agent_status\":\"working\",\"pane_count\":1,\"tab_count\":1,\"active_tab_id\":\"w1:t1\"}],\"tabs\":[{\"tab_id\":\"w1:t1\",\"workspace_id\":\"w1\",\"number\":1,\"label\":\"review\",\"focused\":true,\"agent_status\":\"working\",\"pane_count\":1}],\"panes\":[],\"layouts\":[],\"agents\":[{\"terminal_id\":\"term-1\",\"agent\":\"claude\",\"name\":\"claude\",\"agent_status\":\"working\",\"workspace_id\":\"w1\",\"tab_id\":\"w1:t1\",\"pane_id\":\"w1:p1\",\"focused\":true,\"interactive_ready\":true,\"revision\":3,\"state_change_seq\":7,\"terminal_title\":\"t\",\"terminal_title_stripped\":\"t\"}]}}}\n",
-                )
-                .await
-                .unwrap();
-
-            // Stock Herdr has no ordering API, so no third request is made.
-            assert!(
-                timeout(Duration::from_millis(100), listener.accept())
-                    .await
-                    .is_err()
-            );
-        });
-        let descriptor = SessionDescriptor {
-            name: "default".into(),
-            running: true,
-            socket_path: socket,
-        };
-
-        let observation = HerdrClient::new("herdr")
-            .observe_session(&descriptor, "epoch", 0, 1234)
-            .await
-            .unwrap();
-
-        assert_eq!(observation.session.state, SessionState::Connected);
-        assert_eq!(observation.session.version.as_deref(), Some("0.9.1"));
-        assert_eq!(observation.session.protocol, Some(22));
-        assert_eq!(observation.agent_order, None);
-        assert!(observation.daemon_owned_order);
-        assert_eq!(observation.agents.len(), 1);
-        assert_eq!(observation.agents[0].display_name, "review");
-        assert_eq!(observation.agents[0].status, AgentStatus::Working);
-        assert!(observation.agents[0].actions.interrupt.is_none());
-        server.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn missing_agent_order_api_disables_only_ordering() {
-        let temp = tempdir().unwrap();
-        let socket = temp.path().join("herdr.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
-        let server = tokio::spawn(async move {
-            for (method, response) in [
-                (
-                    "ping",
-                    "{\"result\":{\"version\":\"0.8.0\",\"protocol\":20}}\n",
-                ),
-                (
-                    "session.snapshot",
-                    "{\"result\":{\"snapshot\":{\"workspaces\":[],\"tabs\":[],\"agents\":[]}}}\n",
-                ),
-                (
-                    "agent.order.get",
-                    "{\"error\":{\"code\":\"unknown_method\",\"message\":\"unsupported\"}}\n",
-                ),
-            ] {
+    /// Serves one JSON-RPC request per connection, checking each method.
+    fn serve_core(
+        listener: UnixListener,
+        replies: Vec<(&'static str, Value)>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            for (method, result) in replies {
                 let (stream, _) = listener.accept().await.unwrap();
                 let (read, mut write) = stream.into_split();
                 let mut lines = BufReader::new(read).lines();
                 let request: Value =
                     serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+                assert_eq!(request["jsonrpc"], "2.0");
                 assert_eq!(request["method"], method);
-                write.write_all(response.as_bytes()).await.unwrap();
+                // A notification before the reply must be skipped.
+                let heartbeat = json!({"jsonrpc": "2.0", "method": "heartbeat", "params": {}});
+                let reply = json!({"jsonrpc": "2.0", "id": request["id"], "result": result});
+                write
+                    .write_all(format!("{heartbeat}\n{reply}\n").as_bytes())
+                    .await
+                    .unwrap();
             }
-        });
-        let descriptor = SessionDescriptor {
-            name: "default".into(),
-            running: true,
-            socket_path: socket,
-        };
+        })
+    }
 
-        let observation = HerdrClient::new("herdr")
+    #[tokio::test]
+    async fn observation_reads_status_and_terminals_from_the_core() {
+        let temp = tempdir().unwrap();
+        let socket = temp.path().join("default.sock");
+        let server = serve_core(
+            UnixListener::bind(&socket).unwrap(),
+            vec![
+                ("server.status", json!({"version": "0.1.18", "pid": 1})),
+                (
+                    "terminal.list",
+                    json!({"hidden_finished": 0, "machines": [], "terminals": [record(
+                        "t7",
+                        json!({"labels": herdr_labels("xeneon / 1"),
+                            "status": {"app": "claude-code", "state": "done"}}),
+                    )]}),
+                ),
+            ],
+        );
+        let client = HerdrClient::new(&socket, temp.path().join("missing-app.sock"));
+        let descriptor = client.discover().await.unwrap().remove(0);
+
+        let observation = client
             .observe_session(&descriptor, "epoch", 0, 1234)
             .await
             .unwrap();
+        server.await.unwrap();
 
         assert_eq!(observation.session.state, SessionState::Connected);
-        assert_eq!(observation.agent_order, None);
-        server.await.unwrap();
+        assert_eq!(observation.session.version.as_deref(), Some("0.1.18"));
+        assert_eq!(observation.session.protocol, None);
+        assert_eq!(observation.agents.len(), 1);
+        assert_eq!(observation.agents[0].display_name, "claude-code · xeneon");
+        assert_eq!(observation.agents[0].status, AgentStatus::Done);
+        assert!(!observation.agents[0].focused);
     }
 
     #[tokio::test]
-    async fn set_agent_order_sends_only_the_typed_idempotent_mode() {
+    async fn schema_drift_fails_the_observation() {
         let temp = tempdir().unwrap();
-        let socket = temp.path().join("herdr.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let (read, mut write) = stream.into_split();
-            let mut lines = BufReader::new(read).lines();
-            let request: Value =
-                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
-            assert_eq!(request["method"], "agent.order.set");
-            assert_eq!(request["params"], json!({"order": "priority"}));
-            assert!(request["params"].get("text").is_none());
-            assert!(request["params"].get("keys").is_none());
-            write
-                .write_all(b"{\"result\":{\"type\":\"agent_order\",\"order\":\"priority\"}}\n")
-                .await
-                .unwrap();
-        });
-        let descriptor = SessionDescriptor {
-            name: "default".into(),
-            running: true,
-            socket_path: socket,
-        };
-
-        HerdrClient::new("herdr")
-            .set_agent_order(&descriptor, AgentOrderMode::Priority)
-            .await
-            .unwrap();
-        server.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn get_agent_order_rejects_a_wrong_result_type() {
-        let temp = tempdir().unwrap();
-        let socket = temp.path().join("herdr.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let (read, mut write) = stream.into_split();
-            let mut lines = BufReader::new(read).lines();
-            let request: Value =
-                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
-            assert_eq!(request["method"], "agent.order.get");
-            write
-                .write_all(b"{\"result\":{\"type\":\"agent_view\",\"order\":\"grouped\"}}\n")
-                .await
-                .unwrap();
-        });
-        let descriptor = SessionDescriptor {
-            name: "default".into(),
-            running: true,
-            socket_path: socket,
-        };
-
-        let error = HerdrClient::new("herdr")
-            .get_agent_order(&descriptor)
+        let socket = temp.path().join("default.sock");
+        let server = serve_core(
+            UnixListener::bind(&socket).unwrap(),
+            vec![
+                ("server.status", json!({"version": "9.0.0"})),
+                (
+                    "terminal.list",
+                    json!({"terminals": [{"address": "t1", "state": "live"}]}),
+                ),
+            ],
+        );
+        let client = HerdrClient::new(&socket, temp.path().join("app.sock"));
+        let descriptor = client.discover().await.unwrap().remove(0);
+        let error = client
+            .observe_session(&descriptor, "epoch", 0, 1)
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("unexpected"));
+        assert!(format!("{error:#}").contains("schema changed"));
         server.await.unwrap();
+    }
+
+    /// Answers Herdr app requests in order, recording each one.
+    fn serve_app(
+        listener: UnixListener,
+        replies: Vec<Value>,
+    ) -> tokio::task::JoinHandle<Vec<Value>> {
+        tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for reply in replies {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read, mut write) = stream.into_split();
+                let mut lines = BufReader::new(read).lines();
+                requests.push(
+                    serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap(),
+                );
+                write
+                    .write_all(format!("{reply}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+            requests
+        })
+    }
+
+    #[tokio::test]
+    async fn focus_sends_only_the_typed_agent_focus_command() {
+        let temp = tempdir().unwrap();
+        let app = temp.path().join("herdr-app.sock");
+        let server = serve_app(
+            UnixListener::bind(&app).unwrap(),
+            vec![
+                json!({"ok": true}),
+                json!({"error": "no running terminal \"t9\""}),
+            ],
+        );
+        let client = HerdrClient::new(temp.path().join("core.sock"), &app);
+        let target = HerdrTarget {
+            session: "default".into(),
+            app_socket: app.clone(),
+            terminal: "t9".into(),
+            state_change_seq: 1,
+        };
+
+        client.focus(&target).await.unwrap();
+        assert!(client.focus(&target).await.is_err());
+        let requests = server.await.unwrap();
+        assert_eq!(
+            requests[0],
+            json!({"do": "agent.focus", "args": {"terminal": "t9"}})
+        );
+    }
+
+    #[tokio::test]
+    async fn focused_terminal_is_the_app_focused_pane() {
+        let temp = tempdir().unwrap();
+        let app = temp.path().join("herdr-app.sock");
+        let server = serve_app(
+            UnixListener::bind(&app).unwrap(),
+            vec![
+                json!({"focused_pane": "p2", "agent": "t1"}),
+                json!({"spaces": [{"tabs": [{"terminals": [
+                    {"terminal": "t1", "pane": "p1"},
+                    {"terminal": "t2", "pane": "p2"}
+                ]}]}]}),
+            ],
+        );
+        let client = HerdrClient::new(temp.path().join("core.sock"), &app);
+        assert_eq!(
+            client.focused_terminal().await.unwrap().as_deref(),
+            Some("t2")
+        );
+        let requests = server.await.unwrap();
+        assert_eq!(requests, [json!({"status": true}), json!({"ls": true})]);
     }
 
     #[tokio::test]
     async fn subscription_acknowledges_before_forwarding_invalidations() {
         let temp = tempdir().unwrap();
-        let socket = temp.path().join("herdr.sock");
+        let socket = temp.path().join("default.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
@@ -1201,68 +1036,75 @@ mod tests {
             let request: Value =
                 serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
             assert_eq!(request["method"], "events.subscribe");
-            let subscription_types = request["params"]["subscriptions"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter_map(|subscription| subscription["type"].as_str())
-                .collect::<Vec<_>>();
-            assert!(subscription_types.contains(&"pane.agent_status_changed"));
-            assert!(!subscription_types.contains(&"pane.updated"));
-            assert!(!subscription_types.contains(&"layout.updated"));
-            assert!(!subscription_types.contains(&"workspace.metadata_updated"));
+            assert_eq!(
+                request["params"],
+                json!({"children_of": null, "labels": {}, "terminal": null})
+            );
+            let ack = json!({"jsonrpc": "2.0", "id": request["id"],
+                "result": {"seq": 1, "terminals": []}});
+            let title = json!({"jsonrpc": "2.0", "method": "event",
+                "params": {"type": "title", "terminal": "t1", "data": {"title": "x"}}});
+            let status = json!({"jsonrpc": "2.0", "method": "event",
+                "params": {"type": "status", "terminal": "t1"}});
             write
-                .write_all(b"{\"id\":\"sub\",\"result\":{\"type\":\"subscription_started\"}}\n")
+                .write_all(format!("{ack}\n{title}\n{status}\n").as_bytes())
                 .await
                 .unwrap();
-            write
-                .write_all(
-                    b"{\"event\":\"pane.agent_status_changed\",\"data\":{\"pane_id\":\"w1:p1\"}}\n",
-                )
-                .await
-                .unwrap();
+            // Holding the connection shows the client keeps it open.
+            let _ = lines.next_line().await;
         });
         let descriptor = SessionDescriptor {
             name: "default".into(),
-            running: true,
             socket_path: socket,
         };
-        let (invalidations_tx, mut invalidations_rx) = mpsc::channel(2);
+        let (invalidations_tx, mut invalidations_rx) = mpsc::channel(4);
         let (ready_tx, ready_rx) = oneshot::channel();
-        let watcher = tokio::spawn(async move {
-            watch_events(&descriptor, &["w1:p1".into()], &invalidations_tx, ready_tx).await
-        });
+        let watcher =
+            tokio::spawn(
+                async move { watch_events(&descriptor, &invalidations_tx, ready_tx).await },
+            );
 
         assert_eq!(ready_rx.await.unwrap(), Ok(()));
         assert_eq!(invalidations_rx.recv().await.as_deref(), Some("default"));
-        server.await.unwrap();
-        assert!(watcher.await.unwrap().is_err());
+        assert!(
+            timeout(Duration::from_millis(100), invalidations_rx.recv())
+                .await
+                .is_err(),
+            "a title change must not invalidate"
+        );
+        watcher.abort();
+        server.abort();
     }
 
     #[tokio::test]
-    async fn bad_subscription_ack_never_becomes_ready() {
+    async fn a_refused_subscription_never_becomes_ready() {
         let temp = tempdir().unwrap();
-        let socket = temp.path().join("herdr.sock");
+        let socket = temp.path().join("default.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let (read, mut write) = stream.into_split();
             let mut lines = BufReader::new(read).lines();
-            let _ = lines.next_line().await.unwrap();
+            let request: Value =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            let reply = json!({"jsonrpc": "2.0", "id": request["id"],
+                "error": {"code": -32000, "message": "machine_unknown"}});
             write
-                .write_all(b"{\"id\":\"sub\",\"error\":{\"code\":\"invalid\"}}\n")
+                .write_all(format!("{reply}\n").as_bytes())
                 .await
                 .unwrap();
         });
         let descriptor = SessionDescriptor {
             name: "default".into(),
-            running: true,
             socket_path: socket,
         };
         let (invalidations_tx, _) = mpsc::channel(1);
         let (ready_tx, ready_rx) = oneshot::channel();
-        let result = watch_events(&descriptor, &[], &invalidations_tx, ready_tx).await;
-        assert!(result.is_err());
+        assert!(
+            watch_events(&descriptor, &invalidations_tx, ready_tx)
+                .await
+                .is_err()
+        );
         assert!(ready_rx.await.unwrap().is_err());
         server.await.unwrap();
     }
