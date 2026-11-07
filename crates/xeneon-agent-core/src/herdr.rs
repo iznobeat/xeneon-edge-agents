@@ -542,9 +542,14 @@ impl StatusWords {
             Some("event") => match params["type"].as_str() {
                 Some(kind) if IGNORED_EVENTS.contains(&kind) => false,
                 Some("status") => {
+                    // Live events carry `terminal` and `data.status` (null once
+                    // a program stops reporting). Any other shape refreshes.
                     let Some(terminal) = params["terminal"].as_str() else {
                         return true;
                     };
+                    if params["data"].get("status").is_none() {
+                        return true;
+                    }
                     let word = status_word(&params["data"]["status"]);
                     self.0.insert(terminal.to_owned(), word.clone()) != Some(word)
                 }
@@ -912,6 +917,11 @@ mod tests {
         assert!(words.invalidates(&status("t2", json!({"state": "idle"}))));
         assert!(words.invalidates(&status("t9", json!({"state": "idle"}))));
         assert!(words.invalidates(&status("t9", Value::Null)));
+        // An unexpected payload shape never suppresses a change.
+        let drifted = json!({"method": "event", "params": {"type": "status",
+            "terminal": "t1", "data": {"state": "idle"}}});
+        assert!(words.invalidates(&drifted));
+        assert!(words.invalidates(&drifted));
         assert!(words.invalidates(&json!({"method": "missed", "params": {"terminals": []}})));
         assert!(!words.invalidates(&json!({"id": "x", "result": {}})));
     }
