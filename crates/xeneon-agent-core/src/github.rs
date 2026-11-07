@@ -307,7 +307,7 @@ fn bounded(value: &str, limit: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf};
+    use std::path::PathBuf;
 
     use super::*;
 
@@ -315,7 +315,7 @@ mod tests {
     // checks that a configured account's token arrives in the environment.
     fn fake_gh(dir: &std::path::Path) -> PathBuf {
         let path = dir.join("gh");
-        fs::write(
+        crate::test_support::write_executable(
             &path,
             r#"#!/bin/sh
 case "$*" in *gho_work*) exit 9 ;; esac
@@ -329,9 +329,7 @@ case "$2" in
   *) exit 1 ;;
 esac
 "#,
-        )
-        .unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        );
         path
     }
 

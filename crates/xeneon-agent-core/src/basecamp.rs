@@ -300,14 +300,14 @@ fn bounded(value: &str, limit: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, os::unix::fs::PermissionsExt};
+    use std::fs;
 
     use super::*;
 
     // A stand-in CLI that answers each read command with recorded output.
     fn fake_cli(dir: &std::path::Path) -> PathBuf {
         let path = dir.join("basecamp");
-        fs::write(
+        crate::test_support::write_executable(
             &path,
             r#"#!/bin/sh
 case "$1 $2" in
@@ -320,9 +320,7 @@ case "$1 $2" in
   *) exit 1 ;;
 esac
 "#,
-        )
-        .unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        );
         path
     }
 
@@ -374,12 +372,10 @@ esac
         let temp = tempfile::tempdir().unwrap();
         let log = temp.path().join("args.log");
         let bin = temp.path().join("basecamp");
-        fs::write(
+        crate::test_support::write_executable(
             &bin,
             format!("#!/bin/sh\necho \"$@\" >> {}\nexit 1\n", log.display()),
-        )
-        .unwrap();
-        fs::set_permissions(&bin, fs::Permissions::from_mode(0o700)).unwrap();
+        );
         let mut client = client(bin);
         client.config.profile = Some("jonh".into());
         client.sample().await;

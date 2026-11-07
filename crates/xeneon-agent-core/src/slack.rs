@@ -971,7 +971,7 @@ mod tests {
     // each Web API method with recorded output.
     fn fake_curl(dir: &Path) -> PathBuf {
         let path = dir.join("curl");
-        fs::write(
+        crate::test_support::write_executable(
             &path,
             r#"#!/bin/sh
 config=$(cat)
@@ -994,9 +994,7 @@ case "$url" in
   *) echo '{"ok":false,"error":"unknown_method"}' ;;
 esac
 "#,
-        )
-        .unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        );
         path
     }
 

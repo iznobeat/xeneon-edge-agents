@@ -2055,15 +2055,13 @@ mod tests {
         let log_path = temp.path().join("voice-args");
         let binary = temp.path().join("voxtype");
         fs::write(&state_path, "idle").unwrap();
-        fs::write(
+        crate::test_support::write_executable(
             &binary,
             format!(
                 "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n",
                 log_path.display()
             ),
-        )
-        .unwrap();
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        );
 
         let (mut runtime, _) = DaemonRuntime::new(test_config()).unwrap();
         runtime.voice = Arc::new(Mutex::new(VoiceController::new(

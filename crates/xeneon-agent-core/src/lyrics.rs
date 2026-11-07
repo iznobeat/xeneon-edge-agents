@@ -386,7 +386,7 @@ fn bounded(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, os::unix::fs::PermissionsExt, path::Path};
+    use std::{fs, path::Path};
 
     use super::*;
 
@@ -483,7 +483,7 @@ mod tests {
             fs::write(dir.join(format!("{name}.status")), status.to_string()).unwrap();
         }
         let path = dir.join("curl");
-        fs::write(
+        crate::test_support::write_executable(
             &path,
             format!(
                 r#"#!/bin/sh
@@ -499,9 +499,7 @@ printf '\n%s' "$(cat '{dir}/'$name.status)"
 "#,
                 dir = dir.display()
             ),
-        )
-        .unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        );
         path
     }
 

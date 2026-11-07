@@ -259,7 +259,6 @@ fn is_regular_file(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn voxtype_states_are_normalized_without_payloads() {
@@ -330,8 +329,7 @@ mod tests {
     async fn hung_voice_command_is_killed_after_the_bound() {
         let temp = tempfile::tempdir().unwrap();
         let binary = temp.path().join("voxtype-hangs");
-        fs::write(&binary, "#!/bin/sh\nsleep 30\n").unwrap();
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        crate::test_support::write_executable(&binary, "#!/bin/sh\nsleep 30\n");
 
         let completed =
             run_voxtype_with_timeout(&binary, &["record", "start"], Duration::from_millis(25))
@@ -384,16 +382,14 @@ mod tests {
         } else {
             "voxtype-failure"
         });
-        fs::write(
+        crate::test_support::write_executable(
             &binary,
             format!(
                 "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nprintf '%s\\n' 'private transcript stderr' >&2\nexit {}\n",
                 log.display(),
                 if success { 0 } else { 1 }
             ),
-        )
-        .unwrap();
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        );
         binary
     }
 }

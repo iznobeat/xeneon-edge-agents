@@ -714,7 +714,7 @@ fn window_selector(address: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, io::Write};
+    use std::fs;
 
     use super::*;
 
@@ -915,9 +915,9 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let log = temp.path().join("dispatch.log");
         let hyprctl = temp.path().join("hyprctl");
-        write_executable(
+        crate::test_support::write_executable(
             &hyprctl,
-            &format!(
+            format!(
                 r#"#!/bin/sh
 if [ "$1" = "clients" ]; then
   printf '%s\n' '[{{"address":"0xabc","class":"spotify","initialClass":"spotify","title":"Spotify","pid":42,"monitor":{monitor}}}]'
@@ -967,9 +967,9 @@ fi
         let temp = tempfile::tempdir().unwrap();
         let log = temp.path().join("dispatch.log");
         let hyprctl = temp.path().join("hyprctl");
-        write_executable(
+        crate::test_support::write_executable(
             &hyprctl,
-            &format!(
+            format!(
                 r#"#!/bin/sh
 if [ "$1" = "clients" ]; then
   printf '%s\n' '[{{"address":"0xabc","class":"spotify","initialClass":"spotify","title":"Spotify","pid":42,"monitor":2}}]'
@@ -1012,9 +1012,9 @@ fi
         let log = temp.path().join("dispatch.log");
         let hyprctl = temp.path().join("hyprctl");
         let uwsm = temp.path().join("uwsm");
-        write_executable(
+        crate::test_support::write_executable(
             &hyprctl,
-            &format!(
+            format!(
                 r#"#!/bin/sh
 if [ "$1" = "clients" ]; then
   if [ -e "{marker}" ]; then
@@ -1033,7 +1033,10 @@ fi
                 log = log.display()
             ),
         );
-        write_executable(&uwsm, &format!("#!/bin/sh\n: > \"{}\"\n", marker.display()));
+        crate::test_support::write_executable(
+            &uwsm,
+            format!("#!/bin/sh\n: > \"{}\"\n", marker.display()),
+        );
         let config = DesktopConfig {
             edge_output: Some("DP-2".into()),
             ..DesktopConfig::default()
@@ -1151,9 +1154,9 @@ fi
         let focus_log = temp.path().join("focus.log");
         let hyprctl = temp.path().join("hyprctl");
         let uwsm = temp.path().join("uwsm");
-        write_executable(
+        crate::test_support::write_executable(
             &hyprctl,
-            &format!(
+            format!(
                 r#"#!/bin/sh
 if [ "$1" = "clients" ]; then
   if [ -e "{marker}" ]; then
@@ -1172,9 +1175,9 @@ fi
                 focus_log = focus_log.display()
             ),
         );
-        write_executable(
+        crate::test_support::write_executable(
             &uwsm,
-            &format!(
+            format!(
                 r#"#!/bin/sh
 printf '%s\n' "$*" >> "{launch_log}"
 ( sleep 0.05; : > "{marker}" ) &
@@ -1244,7 +1247,7 @@ sleep 1
         let launch_log = temp.path().join("launch.log");
         let hyprctl = temp.path().join("hyprctl");
         let uwsm = temp.path().join("uwsm");
-        write_executable(
+        crate::test_support::write_executable(
             &hyprctl,
             r#"#!/bin/sh
 if [ "$1" = "clients" ]; then
@@ -1254,9 +1257,9 @@ else
 fi
 "#,
         );
-        write_executable(
+        crate::test_support::write_executable(
             &uwsm,
-            &format!(
+            format!(
                 r#"#!/bin/sh
 printf '%s\n' "$*" >> "{launch_log}"
 "#,
@@ -1284,23 +1287,5 @@ printf '%s\n' "$*" >> "{launch_log}"
                 .is_err()
         );
         assert_eq!(fs::read_to_string(launch_log).unwrap().lines().count(), 2);
-    }
-
-    /// Written by a child process: a write fd held here would leak into any
-    /// test forking at that moment, and running the stub then fails ETXTBSY.
-    fn write_executable(path: &Path, contents: &str) {
-        let mut writer = std::process::Command::new("sh")
-            .args(["-c", "cat >\"$1\" && chmod 700 \"$1\"", "sh"])
-            .arg(path)
-            .stdin(Stdio::piped())
-            .spawn()
-            .unwrap();
-        writer
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(contents.as_bytes())
-            .unwrap();
-        assert!(writer.wait().unwrap().success());
     }
 }
